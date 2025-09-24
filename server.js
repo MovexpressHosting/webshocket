@@ -18,9 +18,9 @@ const io = new Server(httpServer, {
 // MySQL Configuration
 const dbConfig = {
   host: "srv657.hstgr.io",
-  user: "u442108067_MoveExpress",
-  password: "@1ItH~?ztgV",
-  database: "u442108067_MoveExpress",
+  user: "u442108067_mydb",
+  password: "mOhe6ln0iP>",
+  database: "u442108067_mydb",
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0
