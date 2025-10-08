@@ -99,6 +99,39 @@ io.on('connection', (socket) => {
     }
   });
 
+  // Handle manual driver disconnection
+  socket.on('disconnectUser', (driverId) => {
+    console.log('Manual driver disconnection:', driverId);
+    
+    // Find all sockets for this driver
+    const driverSockets = Object.entries(users).filter(
+      ([id, user]) => user.driverId === driverId && user.type === 'user'
+    );
+    
+    // Remove all driver sockets
+    driverSockets.forEach(([socketId, user]) => {
+      console.log(`Removing driver socket: ${socketId} for driver: ${driverId}`);
+      delete users[socketId];
+      
+      // Force disconnect the socket
+      const driverSocket = io.sockets.sockets.get(socketId);
+      if (driverSocket) {
+        driverSocket.disconnect(true);
+      }
+    });
+    
+    // Update online users list
+    const onlineUsers = Object.entries(users).map(([id, user]) => ({
+      id,
+      name: user.name,
+      type: user.type,
+      driverId: user.driverId,
+    }));
+    io.emit('onlineUsers', onlineUsers);
+    
+    console.log(`Driver ${driverId} manually disconnected. Remaining users:`, Object.keys(users).length);
+  });
+
   socket.on('sendMessage', async (message) => {
     console.log('Message received:', message);
     const { receiverId, driverId, ...rest } = message;
@@ -152,13 +185,21 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('disconnect', () => {
-    console.log('Client disconnected:', socket.id);
-    if (users[socket.id]?.type === 'admin') {
+  socket.on('disconnect', (reason) => {
+    console.log('Client disconnected:', socket.id, 'Reason:', reason);
+    
+    const disconnectedUser = users[socket.id];
+    
+    if (disconnectedUser?.type === 'admin') {
       adminOnline = false;
       io.emit('adminStatus', false);
+      console.log('Admin went offline');
     }
+    
+    // Remove user from tracking
     delete users[socket.id];
+    
+    // Update online users list
     const onlineUsers = Object.entries(users).map(([id, user]) => ({
       id,
       name: user.name,
@@ -166,6 +207,8 @@ io.on('connection', (socket) => {
       driverId: user.driverId,
     }));
     io.emit('onlineUsers', onlineUsers);
+    
+    console.log(`User disconnected. Remaining users:`, Object.keys(users).length);
   });
 });
 
