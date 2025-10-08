@@ -15,7 +15,6 @@ const io = new Server(httpServer, {
   }
 });
 
-// MySQL Configuration
 const dbConfig = {
   host: "srv657.hstgr.io",
   user: "u442108067_mydb",
@@ -26,14 +25,11 @@ const dbConfig = {
   queueLimit: 0
 };
 
-// Create MySQL connection pool
 const pool = mysql.createPool(dbConfig);
 
-// Track online status and users
 let adminOnline = false;
-const users = {}; // { socketId: { type: 'user'|'admin', name: string, driverId?: string } }
+const users = {};
 
-// Create messages table if not exists
 async function initializeDatabase() {
   const connection = await pool.getConnection();
   try {
@@ -44,7 +40,7 @@ async function initializeDatabase() {
         sender_id VARCHAR(50) NOT NULL,
         receiver_id VARCHAR(50),
         driver_id VARCHAR(50) NOT NULL,
-        text TEXT NOT NULL,
+        text TEXT,
         timestamp DATETIME NOT NULL,
         sender_type ENUM('user', 'support') NOT NULL,
         INDEX (sender_id),
@@ -87,40 +83,34 @@ io.on('connection', (socket) => {
     io.emit('onlineUsers', onlineUsers);
   });
 
-  // New event to get driver's socket ID
   socket.on('getDriverSocketId', (driverId, callback) => {
     const driverSocket = Object.entries(users).find(
       ([id, user]) => user.driverId === driverId && user.type === 'user'
     );
     if (driverSocket) {
-      callback(driverSocket[0]); // Return the socket ID
+      callback(driverSocket[0]);
     } else {
-      callback(null); // Driver not found or offline
+      callback(null);
     }
   });
 
-  // Handle manual driver disconnection
   socket.on('disconnectUser', (driverId) => {
     console.log('Manual driver disconnection:', driverId);
     
-    // Find all sockets for this driver
     const driverSockets = Object.entries(users).filter(
       ([id, user]) => user.driverId === driverId && user.type === 'user'
     );
     
-    // Remove all driver sockets
     driverSockets.forEach(([socketId, user]) => {
       console.log(`Removing driver socket: ${socketId} for driver: ${driverId}`);
       delete users[socketId];
       
-      // Force disconnect the socket
       const driverSocket = io.sockets.sockets.get(socketId);
       if (driverSocket) {
         driverSocket.disconnect(true);
       }
     });
     
-    // Update online users list
     const onlineUsers = Object.entries(users).map(([id, user]) => ({
       id,
       name: user.name,
@@ -134,10 +124,11 @@ io.on('connection', (socket) => {
 
   socket.on('sendMessage', async (message) => {
     console.log('Message received:', message);
-    const { receiverId, driverId, ...rest } = message;
+    
+    const messageId = message.id || `msg-${Date.now()}`;
     const messageWithTimestamp = {
-      ...rest,
-      id: `msg-${Date.now()}`,
+      ...message,
+      id: messageId,
       timestamp: new Date().toISOString(),
       senderId: socket.id,
       senderName: users[socket.id]?.name || 'Unknown',
@@ -153,9 +144,9 @@ io.on('connection', (socket) => {
         [
           messageWithTimestamp.id,
           socket.id,
-          receiverId,
+          messageWithTimestamp.receiverId,
           messageWithTimestamp.driverId,
-          messageWithTimestamp.text,
+          messageWithTimestamp.text || '',
           messageWithTimestamp.timestamp,
           messageWithTimestamp.sender_type,
         ]
@@ -165,14 +156,12 @@ io.on('connection', (socket) => {
       console.error('Error saving message:', error);
     }
 
-    // Route the message to the correct receiver
-    if (receiverId) {
-      if (users[receiverId]) {
-        io.to(receiverId).emit('receiveMessage', messageWithTimestamp);
-      } else if (receiverId === 'admin') {
+    if (messageWithTimestamp.receiverId) {
+      if (users[messageWithTimestamp.receiverId]) {
+        io.to(messageWithTimestamp.receiverId).emit('receiveMessage', messageWithTimestamp);
+      } else if (messageWithTimestamp.receiverId === 'admin') {
         io.to('admin').emit('receiveMessage', messageWithTimestamp);
       } else if (messageWithTimestamp.driverId) {
-        // If receiverId is not set but driverId is, find the driver's socket
         const driverSocket = Object.entries(users).find(
           ([id, user]) => user.driverId === messageWithTimestamp.driverId && user.type === 'user'
         );
@@ -196,10 +185,8 @@ io.on('connection', (socket) => {
       console.log('Admin went offline');
     }
     
-    // Remove user from tracking
     delete users[socket.id];
     
-    // Update online users list
     const onlineUsers = Object.entries(users).map(([id, user]) => ({
       id,
       name: user.name,
@@ -212,12 +199,8 @@ io.on('connection', (socket) => {
   });
 });
 
-// API endpoint to fetch old messages
-// API endpoint to fetch old messages with media
-// API endpoint to fetch old messages with media
 app.get('/api/messages/:driverId', async (req, res) => {
   try {
-    // First get all messages
     const [messages] = await pool.query(
       `SELECT *,
        CASE
@@ -231,21 +214,17 @@ app.get('/api/messages/:driverId', async (req, res) => {
       [req.params.driverId]
     );
 
-    // If no messages found, return empty array
     if (messages.length === 0) {
       return res.json([]);
     }
 
-    // Get message IDs
     const messageIds = messages.map(msg => msg.message_id);
     
-    // Then get all media for these messages
     const [mediaRows] = await pool.query(
       `SELECT * FROM media_uploads WHERE message_id IN (?)`,
       [messageIds]
     );
     
-    // Group media by message_id
     const mediaMap = {};
     mediaRows.forEach(media => {
       if (!mediaMap[media.message_id]) {
@@ -262,20 +241,34 @@ app.get('/api/messages/:driverId', async (req, res) => {
       });
     });
 
-    // Combine messages with their media
     const messagesWithMedia = messages.map(message => {
       return {
         ...message,
-        media: mediaMap[message.message_id] || [] // Use empty array if no media
+        media: mediaMap[message.message_id] || []
       };
     });
 
-    console.log(`✅ Loaded ${messagesWithMedia.length} messages with media data`);
+    console.log(`✅ Loaded ${messagesWithMedia.length} messages with ${mediaRows.length} media files`);
     
     res.json(messagesWithMedia);
   } catch (error) {
     console.error('Error fetching messages:', error);
     res.status(500).json({ error: 'Failed to fetch messages' });
+  }
+});
+
+app.get('/api/debug-media', async (req, res) => {
+  try {
+    const [mediaRows] = await pool.query('SELECT * FROM media_uploads ORDER BY upload_time DESC LIMIT 10');
+    const [messageRows] = await pool.query('SELECT message_id, driver_id, text FROM messages ORDER BY timestamp DESC LIMIT 10');
+    
+    res.json({
+      media_uploads: mediaRows,
+      recent_messages: messageRows
+    });
+  } catch (error) {
+    console.error('Debug error:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -300,5 +293,3 @@ httpServer.listen(PORT, () => {
   console.log(`- Local:   http://localhost:${PORT}`);
   console.log(`- Network: http://${localIp}:${PORT}`);
 });
-
-
