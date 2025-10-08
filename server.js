@@ -214,50 +214,64 @@ io.on('connection', (socket) => {
 
 // API endpoint to fetch old messages
 // API endpoint to fetch old messages with media
+// API endpoint to fetch old messages with media
 app.get('/api/messages/:driverId', async (req, res) => {
   try {
-    const [rows] = await pool.query(
-      `SELECT m.*,
+    // First get all messages
+    const [messages] = await pool.query(
+      `SELECT *,
        CASE
-         WHEN m.sender_id = 'admin' THEN 'support'
+         WHEN sender_id = 'admin' THEN 'support'
          ELSE 'user'
        END as sender,
-       m.sender_type,
-       GROUP_CONCAT(
-         JSON_OBJECT(
-           'id', mu.id,
-           'message_id', mu.message_id,
-           'driver_id', mu.driver_id,
-           'file_name', mu.file_name,
-           'file_url', mu.file_url,
-           'media_type', mu.media_type,
-           'upload_time', mu.upload_time
-         )
-       ) as media
-       FROM messages m
-       LEFT JOIN media_uploads mu ON m.message_id = mu.message_id
-       WHERE m.driver_id = ?
-       GROUP BY m.id
-       ORDER BY m.timestamp ASC`,
+       sender_type
+       FROM messages
+       WHERE driver_id = ?
+       ORDER BY timestamp ASC`,
       [req.params.driverId]
     );
 
-    // Parse the media data
-    const messagesWithMedia = rows.map(message => {
-      if (message.media) {
-        try {
-          // Parse the concatenated media JSON objects
-          message.media = JSON.parse(`[${message.media}]`);
-        } catch (error) {
-          console.error('Error parsing media data:', error);
-          message.media = [];
-        }
-      } else {
-        message.media = [];
+    // If no messages found, return empty array
+    if (messages.length === 0) {
+      return res.json([]);
+    }
+
+    // Get message IDs
+    const messageIds = messages.map(msg => msg.message_id);
+    
+    // Then get all media for these messages
+    const [mediaRows] = await pool.query(
+      `SELECT * FROM media_uploads WHERE message_id IN (?)`,
+      [messageIds]
+    );
+    
+    // Group media by message_id
+    const mediaMap = {};
+    mediaRows.forEach(media => {
+      if (!mediaMap[media.message_id]) {
+        mediaMap[media.message_id] = [];
       }
-      return message;
+      mediaMap[media.message_id].push({
+        id: media.id,
+        message_id: media.message_id,
+        driver_id: media.driver_id,
+        file_name: media.file_name,
+        file_url: media.file_url,
+        media_type: media.media_type,
+        upload_time: media.upload_time
+      });
     });
 
+    // Combine messages with their media
+    const messagesWithMedia = messages.map(message => {
+      return {
+        ...message,
+        media: mediaMap[message.message_id] || [] // Use empty array if no media
+      };
+    });
+
+    console.log(`✅ Loaded ${messagesWithMedia.length} messages with media data`);
+    
     res.json(messagesWithMedia);
   } catch (error) {
     console.error('Error fetching messages:', error);
@@ -286,4 +300,5 @@ httpServer.listen(PORT, () => {
   console.log(`- Local:   http://localhost:${PORT}`);
   console.log(`- Network: http://${localIp}:${PORT}`);
 });
+
 
