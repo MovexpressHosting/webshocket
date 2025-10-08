@@ -213,21 +213,52 @@ io.on('connection', (socket) => {
 });
 
 // API endpoint to fetch old messages
+// API endpoint to fetch old messages with media
 app.get('/api/messages/:driverId', async (req, res) => {
   try {
     const [rows] = await pool.query(
-      `SELECT *,
+      `SELECT m.*,
        CASE
-         WHEN sender_id = 'admin' THEN 'support'
+         WHEN m.sender_id = 'admin' THEN 'support'
          ELSE 'user'
        END as sender,
-       sender_type
-       FROM messages
-       WHERE driver_id = ?
-       ORDER BY timestamp ASC`,
+       m.sender_type,
+       GROUP_CONCAT(
+         JSON_OBJECT(
+           'id', mu.id,
+           'message_id', mu.message_id,
+           'driver_id', mu.driver_id,
+           'file_name', mu.file_name,
+           'file_url', mu.file_url,
+           'media_type', mu.media_type,
+           'upload_time', mu.upload_time
+         )
+       ) as media
+       FROM messages m
+       LEFT JOIN media_uploads mu ON m.message_id = mu.message_id
+       WHERE m.driver_id = ?
+       GROUP BY m.id
+       ORDER BY m.timestamp ASC`,
       [req.params.driverId]
     );
-    res.json(rows);
+
+    // Parse the media data
+    const messagesWithMedia = rows.map(message => {
+      if (message.media) {
+        try {
+          // Parse the concatenated media JSON objects
+          message.media = JSON.parse(`[${message.media}]`);
+        } catch (error) {
+          console.error('Error parsing media data:', error);
+          message.media = [];
+        }
+      } else {
+        message.media = [];
+      }
+      return message;
+    });
+
+    res.json(messagesWithMedia);
   } catch (error) {
     console.error('Error fetching messages:', error);
     res.status(500).json({ error: 'Failed to fetch messages' });
@@ -255,3 +286,4 @@ httpServer.listen(PORT, () => {
   console.log(`- Local:   http://localhost:${PORT}`);
   console.log(`- Network: http://${localIp}:${PORT}`);
 });
+
