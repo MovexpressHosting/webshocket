@@ -222,8 +222,11 @@ io.on('connection', (socket) => {
 });
 
 // API endpoint to fetch old messages
+// API endpoint to fetch old messages
 app.get('/api/messages/:driverId', async (req, res) => {
   try {
+    console.log('📥 Fetching messages for driver:', req.params.driverId);
+    
     const [rows] = await pool.query(
       `SELECT *,
        CASE
@@ -238,7 +241,9 @@ app.get('/api/messages/:driverId', async (req, res) => {
       [req.params.driverId]
     );
     
-    // Parse media_data from JSON string
+    console.log(`📨 Found ${rows.length} messages for driver ${req.params.driverId}`);
+    
+    // Parse media_data from JSON string and ensure we always return an array
     const messagesWithMedia = rows.map(row => ({
       ...row,
       media: row.media_data ? JSON.parse(row.media_data) : null
@@ -246,8 +251,9 @@ app.get('/api/messages/:driverId', async (req, res) => {
     
     res.json(messagesWithMedia);
   } catch (error) {
-    console.error('Error fetching messages:', error);
-    res.status(500).json({ error: 'Failed to fetch messages' });
+    console.error('❌ Error fetching messages:', error);
+    // Always return an array even on error
+    res.status(500).json({ error: 'Failed to fetch messages', messages: [] });
   }
 });
 
@@ -272,3 +278,4 @@ httpServer.listen(PORT, () => {
   console.log(`- Local:   http://localhost:${PORT}`);
   console.log(`- Network: http://${localIp}:${PORT}`);
 });
+
