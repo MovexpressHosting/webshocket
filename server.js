@@ -264,6 +264,7 @@ app.get('/api/messages/:driverId', async (req, res) => {
   }
 });
 
+
 function getLocalIpAddress() {
   const interfaces = os.networkInterfaces();
   for (const devName in interfaces) {
@@ -285,3 +286,4 @@ httpServer.listen(PORT, () => {
   console.log(`- Local:   http://localhost:${PORT}`);
   console.log(`- Network: http://${localIp}:${PORT}`);
 });
+
