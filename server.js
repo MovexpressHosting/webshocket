@@ -4,14 +4,9 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const os = require('os');
 const mysql = require('mysql2/promise');
-const path = require('path');
-const fs = require('fs');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
   cors: {
@@ -49,10 +44,9 @@ async function initializeDatabase() {
         sender_id VARCHAR(50) NOT NULL,
         receiver_id VARCHAR(50),
         driver_id VARCHAR(50) NOT NULL,
-        text TEXT,
+        text TEXT NOT NULL,
         timestamp DATETIME NOT NULL,
         sender_type ENUM('user', 'support') NOT NULL,
-        media_data JSON,
         INDEX (sender_id),
         INDEX (receiver_id),
         INDEX (driver_id),
@@ -140,8 +134,7 @@ io.on('connection', (socket) => {
 
   socket.on('sendMessage', async (message) => {
     console.log('Message received:', message);
-    const { receiverId, driverId, media, ...rest } = message;
-    
+    const { receiverId, driverId, ...rest } = message;
     const messageWithTimestamp = {
       ...rest,
       id: `msg-${Date.now()}`,
@@ -151,13 +144,12 @@ io.on('connection', (socket) => {
       sender: users[socket.id]?.type === 'admin' ? 'support' : 'user',
       sender_type: users[socket.id]?.type === 'admin' ? 'support' : 'user',
       driverId: message.driverId || users[socket.id]?.driverId,
-      media: media || null,
     };
 
     try {
       const connection = await pool.getConnection();
       await connection.query(
-        'INSERT INTO messages (message_id, sender_id, receiver_id, driver_id, text, timestamp, sender_type, media_data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO messages (message_id, sender_id, receiver_id, driver_id, text, timestamp, sender_type) VALUES (?, ?, ?, ?, ?, ?, ?)',
         [
           messageWithTimestamp.id,
           socket.id,
@@ -166,7 +158,6 @@ io.on('connection', (socket) => {
           messageWithTimestamp.text,
           messageWithTimestamp.timestamp,
           messageWithTimestamp.sender_type,
-          media ? JSON.stringify(media) : null,
         ]
       );
       connection.release();
@@ -222,38 +213,24 @@ io.on('connection', (socket) => {
 });
 
 // API endpoint to fetch old messages
-// API endpoint to fetch old messages
 app.get('/api/messages/:driverId', async (req, res) => {
   try {
-    console.log('📥 Fetching messages for driver:', req.params.driverId);
-    
     const [rows] = await pool.query(
       `SELECT *,
        CASE
          WHEN sender_id = 'admin' THEN 'support'
          ELSE 'user'
        END as sender,
-       sender_type,
-       media_data
+       sender_type
        FROM messages
        WHERE driver_id = ?
        ORDER BY timestamp ASC`,
       [req.params.driverId]
     );
-    
-    console.log(`📨 Found ${rows.length} messages for driver ${req.params.driverId}`);
-    
-    // Parse media_data from JSON string and ensure we always return an array
-    const messagesWithMedia = rows.map(row => ({
-      ...row,
-      media: row.media_data ? JSON.parse(row.media_data) : null
-    }));
-    
-    res.json(messagesWithMedia);
+    res.json(rows);
   } catch (error) {
-    console.error('❌ Error fetching messages:', error);
-    // Always return an array even on error
-    res.status(500).json({ error: 'Failed to fetch messages', messages: [] });
+    console.error('Error fetching messages:', error);
+    res.status(500).json({ error: 'Failed to fetch messages' });
   }
 });
 
@@ -278,4 +255,3 @@ httpServer.listen(PORT, () => {
   console.log(`- Local:   http://localhost:${PORT}`);
   console.log(`- Network: http://${localIp}:${PORT}`);
 });
-
