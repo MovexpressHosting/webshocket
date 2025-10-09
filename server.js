@@ -155,7 +155,7 @@ io.on('connection', (socket) => {
     let connection;
     try {
       connection = await pool.getConnection();
-      // Insert into messages table
+      // Only insert the message, not the media
       await connection.query(
         'INSERT INTO messages (message_id, sender_id, receiver_id, driver_id, text, timestamp, sender_type) VALUES (?, ?, ?, ?, ?, ?, ?)',
         [
@@ -168,27 +168,8 @@ io.on('connection', (socket) => {
           messageWithTimestamp.sender_type,
         ]
       );
-
-      // If media is present, insert into media_uploads table
-      if (media && media.length > 0) {
-        for (const item of media) {
-          await connection.query(
-            'INSERT INTO media_uploads (message_id, driver_id, file_name, file_url, media_type, upload_time, file_size, mime_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-            [
-              messageWithTimestamp.message_id,
-              messageWithTimestamp.driver_id,
-              item.file_name,
-              item.file_url,
-              item.media_type,
-              messageWithTimestamp.timestamp,
-              item.file_size,
-              item.mime_type,
-            ]
-          );
-        }
-      }
     } catch (error) {
-      console.error('Error saving message or media:', error);
+      console.error('Error saving message:', error);
     } finally {
       if (connection) connection.release();
     }
