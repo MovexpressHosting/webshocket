@@ -102,24 +102,24 @@ io.on('connection', (socket) => {
   // Handle manual driver disconnection
   socket.on('disconnectUser', (driverId) => {
     console.log('Manual driver disconnection:', driverId);
-    
+
     // Find all sockets for this driver
     const driverSockets = Object.entries(users).filter(
       ([id, user]) => user.driverId === driverId && user.type === 'user'
     );
-    
+
     // Remove all driver sockets
     driverSockets.forEach(([socketId, user]) => {
       console.log(`Removing driver socket: ${socketId} for driver: ${driverId}`);
       delete users[socketId];
-      
+
       // Force disconnect the socket
       const driverSocket = io.sockets.sockets.get(socketId);
       if (driverSocket) {
         driverSocket.disconnect(true);
       }
     });
-    
+
     // Update online users list
     const onlineUsers = Object.entries(users).map(([id, user]) => ({
       id,
@@ -128,7 +128,7 @@ io.on('connection', (socket) => {
       driverId: user.driverId,
     }));
     io.emit('onlineUsers', onlineUsers);
-    
+
     console.log(`Driver ${driverId} manually disconnected. Remaining users:`, Object.keys(users).length);
   });
 
@@ -145,7 +145,6 @@ io.on('connection', (socket) => {
       sender_type: users[socket.id]?.type === 'admin' ? 'support' : 'user',
       driverId: message.driverId || users[socket.id]?.driverId,
     };
-
     try {
       const connection = await pool.getConnection();
       await connection.query(
@@ -164,7 +163,6 @@ io.on('connection', (socket) => {
     } catch (error) {
       console.error('Error saving message:', error);
     }
-
     // Route the message to the correct receiver
     if (receiverId) {
       if (users[receiverId]) {
@@ -187,18 +185,18 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', (reason) => {
     console.log('Client disconnected:', socket.id, 'Reason:', reason);
-    
+
     const disconnectedUser = users[socket.id];
-    
+
     if (disconnectedUser?.type === 'admin') {
       adminOnline = false;
       io.emit('adminStatus', false);
       console.log('Admin went offline');
     }
-    
+
     // Remove user from tracking
     delete users[socket.id];
-    
+
     // Update online users list
     const onlineUsers = Object.entries(users).map(([id, user]) => ({
       id,
@@ -207,15 +205,16 @@ io.on('connection', (socket) => {
       driverId: user.driverId,
     }));
     io.emit('onlineUsers', onlineUsers);
-    
+
     console.log(`User disconnected. Remaining users:`, Object.keys(users).length);
   });
 });
 
-// API endpoint to fetch old messages
+// API endpoint to fetch old messages with associated media
 app.get('/api/messages/:driverId', async (req, res) => {
   try {
-    const [rows] = await pool.query(
+    // Fetch messages
+    const [messageRows] = await pool.query(
       `SELECT *,
        CASE
          WHEN sender_id = 'admin' THEN 'support'
@@ -227,7 +226,20 @@ app.get('/api/messages/:driverId', async (req, res) => {
        ORDER BY timestamp ASC`,
       [req.params.driverId]
     );
-    res.json(rows);
+
+    // Fetch media for each message
+    const messagesWithMedia = await Promise.all(messageRows.map(async (message) => {
+      const [mediaRows] = await pool.query(
+        'SELECT * FROM media_uploads WHERE message_id = ?',
+        [message.message_id]
+      );
+      return {
+        ...message,
+        media: mediaRows
+      };
+    }));
+
+    res.json(messagesWithMedia);
   } catch (error) {
     console.error('Error fetching messages:', error);
     res.status(500).json({ error: 'Failed to fetch messages' });
