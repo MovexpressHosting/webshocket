@@ -312,23 +312,42 @@ io.on('connection', (socket) => {
 });
 
 // Get messages for driver
-app.get('/api/messages/:driverId', async (req, res) => {
+// Get messages for driver OR customer - Universal endpoint
+app.get('/api/messages/:chatId', async (req, res) => {
   try {
-    console.log('📡 Fetching driver messages for:', req.params.driverId);
+    const { chatId } = req.params;
+    console.log('📡 Fetching messages for chat:', chatId);
 
-    const [messages] = await pool.query(
+    // Try driver messages first
+    let [messages] = await pool.query(
       `SELECT m.*,
        CASE
          WHEN m.sender_type = 'support' THEN 'support'
          ELSE 'user'
        END as sender
        FROM messages m
-       WHERE m.driver_id = ? AND m.chat_type = 'driver'
+       WHERE m.driver_id = ? 
        ORDER BY m.timestamp ASC`,
-      [req.params.driverId]
+      [chatId]
     );
 
-    console.log(`📦 Found ${messages.length} driver messages`);
+    console.log(`📦 Found ${messages.length} driver messages for ${chatId}`);
+
+    // If no driver messages found, try customer messages
+    if (messages.length === 0) {
+      [messages] = await pool.query(
+        `SELECT m.*,
+         CASE
+           WHEN m.sender_type = 'support' THEN 'support'
+           ELSE 'customer'
+         END as sender
+         FROM messages m
+         WHERE m.customer_id = ? 
+         ORDER BY m.timestamp ASC`,
+        [chatId]
+      );
+      console.log(`📦 Found ${messages.length} customer messages for ${chatId}`);
+    }
 
     if (messages.length === 0) {
       return res.json([]);
@@ -341,7 +360,7 @@ app.get('/api/messages/:driverId', async (req, res) => {
       [messageIds]
     );
 
-    console.log(`📸 Found ${mediaRows.length} media files for driver`);
+    console.log(`📸 Found ${mediaRows.length} media files`);
 
     const mediaMap = {};
     mediaRows.forEach(media => {
@@ -352,6 +371,7 @@ app.get('/api/messages/:driverId', async (req, res) => {
         id: media.id,
         message_id: media.message_id,
         driver_id: media.driver_id,
+        customer_id: media.customer_id,
         file_name: media.file_name,
         file_url: media.file_url,
         media_type: media.media_type,
@@ -364,19 +384,20 @@ app.get('/api/messages/:driverId', async (req, res) => {
       media: mediaMap[message.message_id] || []
     }));
 
-    console.log(`✅ Loaded ${messagesWithMedia.length} driver messages with ${mediaRows.length} media files`);
+    console.log(`✅ Loaded ${messagesWithMedia.length} messages with ${mediaRows.length} media files`);
 
     res.json(messagesWithMedia);
   } catch (error) {
-    console.error('❌ Error fetching driver messages:', error);
+    console.error('❌ Error fetching messages:', error);
     res.status(500).json({ error: 'Failed to fetch messages' });
   }
 });
 
-// Get messages for customer
+// Additional endpoint specifically for customer messages (for backward compatibility)
 app.get('/api/customer-messages/:customerId', async (req, res) => {
   try {
-    console.log('📡 Fetching customer messages for:', req.params.customerId);
+    const { customerId } = req.params;
+    console.log('📡 Fetching customer messages for:', customerId);
 
     const [messages] = await pool.query(
       `SELECT m.*,
@@ -385,9 +406,9 @@ app.get('/api/customer-messages/:customerId', async (req, res) => {
          ELSE 'customer'
        END as sender
        FROM messages m
-       WHERE m.customer_id = ? AND m.chat_type = 'customer'
+       WHERE m.customer_id = ? 
        ORDER BY m.timestamp ASC`,
-      [req.params.customerId]
+      [customerId]
     );
 
     console.log(`📦 Found ${messages.length} customer messages`);
@@ -471,3 +492,4 @@ httpServer.listen(PORT, () => {
   console.log(`- Local:   http://localhost:${PORT}`);
   console.log(`- Network: http://${localIp}:${PORT}`);
 });
+
