@@ -39,13 +39,16 @@ async function initializeDatabase() {
         message_id VARCHAR(50) NOT NULL,
         sender_id VARCHAR(50) NOT NULL,
         receiver_id VARCHAR(50),
-        driver_id VARCHAR(50) NOT NULL,
+        driver_id VARCHAR(50),
+        customer_id VARCHAR(50),
         text TEXT,
         timestamp DATETIME NOT NULL,
-        sender_type ENUM('user', 'support') NOT NULL,
+        sender_type ENUM('user', 'support', 'customer') NOT NULL,
+        chat_type ENUM('driver', 'customer') NOT NULL DEFAULT 'driver',
         INDEX (sender_id),
         INDEX (receiver_id),
         INDEX (driver_id),
+        INDEX (customer_id),
         INDEX (timestamp)
       )
     `);
@@ -54,13 +57,16 @@ async function initializeDatabase() {
       CREATE TABLE IF NOT EXISTS media_uploads (
         id INT AUTO_INCREMENT PRIMARY KEY,
         message_id VARCHAR(50) NOT NULL,
-        driver_id VARCHAR(50) NOT NULL,
+        driver_id VARCHAR(50),
+        customer_id VARCHAR(50),
         file_name VARCHAR(255) NOT NULL,
         file_url TEXT NOT NULL,
         media_type ENUM('image', 'video', 'gif') NOT NULL,
         upload_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+        chat_type ENUM('driver', 'customer') NOT NULL DEFAULT 'driver',
         INDEX (message_id),
-        INDEX (driver_id)
+        INDEX (driver_id),
+        INDEX (customer_id)
       )
     `);
     console.log("Database initialized");
@@ -76,30 +82,67 @@ initializeDatabase();
 io.on('connection', (socket) => {
   console.log('New client connected:', socket.id);
 
-  socket.on('register', (userType, userName, driverId) => {
+  socket.on('register', (userType, userName, userId) => {
     users[socket.id] = {
       type: userType,
       name: userName || `User-${socket.id.slice(0, 4)}`,
-      driverId,
+      userId: userId,
     };
     console.log(`User registered as ${userType}:`, socket.id, users[socket.id].name);
-    socket.join(userType);
+    
     if (userType === 'admin') {
+      socket.join('admin');
       adminOnline = true;
       io.emit('adminStatus', true);
+      console.log('Admin joined admin room');
+    } else if (userType === 'user') {
+      // Driver
+      socket.join(`driver_${userId}`);
+      console.log(`Driver joined driver_${userId} room`);
+    } else if (userType === 'customer') {
+      // Customer
+      socket.join(`customer_${userId}`);
+      console.log(`Customer joined customer_${userId} room`);
     }
+    
     const onlineUsers = Object.entries(users).map(([id, user]) => ({
       id,
       name: user.name,
       type: user.type,
-      driverId: user.driverId,
+      userId: user.userId,
+    }));
+    io.emit('onlineUsers', onlineUsers);
+  });
+
+  socket.on('joinChat', (data) => {
+    const { chatId, userType, userId } = data;
+    users[socket.id] = {
+      type: userType,
+      name: userType === 'customer' ? `Customer-${userId}` : `User-${userId}`,
+      userId: userId,
+    };
+    
+    if (userType === 'customer') {
+      socket.join(`customer_${chatId}`);
+      console.log(`Customer ${userId} joined customer_${chatId} room`);
+    } else if (userType === 'admin') {
+      socket.join('admin');
+      adminOnline = true;
+      io.emit('adminStatus', true);
+    }
+    
+    const onlineUsers = Object.entries(users).map(([id, user]) => ({
+      id,
+      name: user.name,
+      type: user.type,
+      userId: user.userId,
     }));
     io.emit('onlineUsers', onlineUsers);
   });
 
   socket.on('getDriverSocketId', (driverId, callback) => {
     const driverSocket = Object.entries(users).find(
-      ([id, user]) => user.driverId === driverId && user.type === 'user'
+      ([id, user]) => user.userId === driverId && user.type === 'user'
     );
     if (driverSocket) {
       callback(driverSocket[0]);
@@ -108,20 +151,31 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('disconnectUser', (driverId) => {
-    console.log('Manual driver disconnection:', driverId);
+  socket.on('getCustomerSocketId', (customerId, callback) => {
+    const customerSocket = Object.entries(users).find(
+      ([id, user]) => user.userId === customerId && user.type === 'customer'
+    );
+    if (customerSocket) {
+      callback(customerSocket[0]);
+    } else {
+      callback(null);
+    }
+  });
 
-    const driverSockets = Object.entries(users).filter(
-      ([id, user]) => user.driverId === driverId && user.type === 'user'
+  socket.on('disconnectUser', (userId, userType) => {
+    console.log('Manual user disconnection:', userId, userType);
+
+    const userSockets = Object.entries(users).filter(
+      ([id, user]) => user.userId === userId && user.type === userType
     );
 
-    driverSockets.forEach(([socketId, user]) => {
-      console.log(`Removing driver socket: ${socketId} for driver: ${driverId}`);
+    userSockets.forEach(([socketId, user]) => {
+      console.log(`Removing user socket: ${socketId} for ${userType}: ${userId}`);
       delete users[socketId];
 
-      const driverSocket = io.sockets.sockets.get(socketId);
-      if (driverSocket) {
-        driverSocket.disconnect(true);
+      const userSocket = io.sockets.sockets.get(socketId);
+      if (userSocket) {
+        userSocket.disconnect(true);
       }
     });
 
@@ -129,65 +183,62 @@ io.on('connection', (socket) => {
       id,
       name: user.name,
       type: user.type,
-      driverId: user.driverId,
+      userId: user.userId,
     }));
     io.emit('onlineUsers', onlineUsers);
 
-    console.log(`Driver ${driverId} manually disconnected. Remaining users:`, Object.keys(users).length);
+    console.log(`${userType} ${userId} manually disconnected. Remaining users:`, Object.keys(users).length);
   });
 
   socket.on('sendMessage', async (message) => {
-    console.log('📨 Message received with media:', message.media?.length || 0);
+    console.log('📨 Message received:', {
+      id: message.id,
+      sender_type: message.sender_type,
+      chat_type: message.chat_type,
+      driverId: message.driverId,
+      customerId: message.customerId,
+      has_media: message.media?.length || 0
+    });
 
     const messageId = message.id || `msg-${Date.now()}`;
+    const isCustomerChat = message.chat_type === 'customer' || message.customerId;
+    const chatType = isCustomerChat ? 'customer' : 'driver';
+    
     const messageWithTimestamp = {
       ...message,
       id: messageId,
       timestamp: new Date().toISOString(),
       senderId: socket.id,
       senderName: users[socket.id]?.name || 'Unknown',
-      sender: users[socket.id]?.type === 'admin' ? 'support' : 'user',
-      sender_type: users[socket.id]?.type === 'admin' ? 'support' : 'user',
-      driverId: message.driverId || users[socket.id]?.driverId,
+      sender: users[socket.id]?.type === 'admin' ? 'support' : (isCustomerChat ? 'customer' : 'user'),
+      sender_type: users[socket.id]?.type === 'admin' ? 'support' : (isCustomerChat ? 'customer' : 'user'),
+      driverId: message.driverId,
+      customerId: message.customerId,
+      chat_type: chatType,
     };
 
     const connection = await pool.getConnection();
     try {
       await connection.beginTransaction();
 
-      // Save ONLY the message to database (media is already saved via PHP upload)
+      // Save message to database
       await connection.query(
-        'INSERT INTO messages (message_id, sender_id, receiver_id, driver_id, text, timestamp, sender_type) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO messages (message_id, sender_id, receiver_id, driver_id, customer_id, text, timestamp, sender_type, chat_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
         [
           messageWithTimestamp.id,
           socket.id,
           messageWithTimestamp.receiverId,
-          messageWithTimestamp.driverId,
+          messageWithTimestamp.driverId || null,
+          messageWithTimestamp.customerId || null,
           messageWithTimestamp.text || '',
           messageWithTimestamp.timestamp,
           messageWithTimestamp.sender_type,
+          chatType
         ]
       );
 
-      // REMOVE THIS ENTIRE BLOCK - media is already saved via PHP upload
-      // if (message.media && message.media.length > 0) {
-      //     console.log('💾 Saving media files to database:', message.media.length);
-      //     for (const media of message.media) {
-      //         await connection.query(
-      //             'INSERT INTO media_uploads (message_id, driver_id, file_name, file_url, media_type) VALUES (?, ?, ?, ?, ?)',
-      //             [
-      //                 messageId,
-      //                 messageWithTimestamp.driverId,
-      //                 media.file_name,
-      //                 media.file_url,
-      //                 media.media_type
-      //             ]
-      //         );
-      //     }
-      // }
-
       await connection.commit();
-      console.log('✅ Message saved to database (media already uploaded)');
+      console.log('✅ Message saved to database');
 
     } catch (error) {
       await connection.rollback();
@@ -197,22 +248,41 @@ io.on('connection', (socket) => {
       connection.release();
     }
 
-    // Rest of your emit logic remains the same...
-    if (messageWithTimestamp.receiverId) {
-      if (users[messageWithTimestamp.receiverId]) {
-        io.to(messageWithTimestamp.receiverId).emit('receiveMessage', messageWithTimestamp);
-      } else if (messageWithTimestamp.receiverId === 'admin') {
+    // Emit message to appropriate recipients
+    if (isCustomerChat) {
+      // Customer chat
+      if (messageWithTimestamp.sender_type === 'customer') {
+        // Customer sending to admin
         io.to('admin').emit('receiveMessage', messageWithTimestamp);
-      } else if (messageWithTimestamp.driverId) {
-        const driverSocket = Object.entries(users).find(
-          ([id, user]) => user.driverId === messageWithTimestamp.driverId && user.type === 'user'
-        );
-        if (driverSocket) {
-          io.to(driverSocket[0]).emit('receiveMessage', messageWithTimestamp);
-        }
+        console.log('📤 Customer message sent to admin');
+      } else {
+        // Admin sending to customer
+        io.to(`customer_${messageWithTimestamp.customerId}`).emit('receiveMessage', messageWithTimestamp);
+        console.log(`📤 Admin message sent to customer_${messageWithTimestamp.customerId}`);
       }
     } else {
-      io.emit('receiveMessage', messageWithTimestamp);
+      // Driver chat
+      if (messageWithTimestamp.sender_type === 'user') {
+        // Driver sending to admin
+        io.to('admin').emit('receiveMessage', messageWithTimestamp);
+        console.log('📤 Driver message sent to admin');
+      } else {
+        // Admin sending to driver
+        io.to(`driver_${messageWithTimestamp.driverId}`).emit('receiveMessage', messageWithTimestamp);
+        console.log(`📤 Admin message sent to driver_${messageWithTimestamp.driverId}`);
+      }
+    }
+
+    // Send notification for offline users
+    if (messageWithTimestamp.sender_type === 'customer' || messageWithTimestamp.sender_type === 'user') {
+      // Customer or driver sent message, notify admin
+      io.to('admin').emit('newMessageNotification', {
+        from: messageWithTimestamp.senderName,
+        message: messageWithTimestamp.text,
+        chatType: chatType,
+        chatId: isCustomerChat ? messageWithTimestamp.customerId : messageWithTimestamp.driverId,
+        timestamp: messageWithTimestamp.timestamp
+      });
     }
   });
 
@@ -233,7 +303,7 @@ io.on('connection', (socket) => {
       id,
       name: user.name,
       type: user.type,
-      driverId: user.driverId,
+      userId: user.userId,
     }));
     io.emit('onlineUsers', onlineUsers);
 
@@ -241,24 +311,24 @@ io.on('connection', (socket) => {
   });
 });
 
+// Get messages for driver
 app.get('/api/messages/:driverId', async (req, res) => {
   try {
-    console.log('📡 Fetching messages for driver:', req.params.driverId);
+    console.log('📡 Fetching driver messages for:', req.params.driverId);
 
     const [messages] = await pool.query(
       `SELECT m.*,
        CASE
-         WHEN m.sender_id = 'admin' THEN 'support'
+         WHEN m.sender_type = 'support' THEN 'support'
          ELSE 'user'
-       END as sender,
-       m.sender_type
+       END as sender
        FROM messages m
-       WHERE m.driver_id = ?
+       WHERE m.driver_id = ? AND m.chat_type = 'driver'
        ORDER BY m.timestamp ASC`,
       [req.params.driverId]
     );
 
-    console.log(`📦 Found ${messages.length} messages for driver ${req.params.driverId}`);
+    console.log(`📦 Found ${messages.length} driver messages`);
 
     if (messages.length === 0) {
       return res.json([]);
@@ -266,14 +336,12 @@ app.get('/api/messages/:driverId', async (req, res) => {
 
     const messageIds = messages.map(msg => msg.message_id);
 
-    console.log('🖼️ Fetching media for message IDs:', messageIds);
-
     const [mediaRows] = await pool.query(
       `SELECT * FROM media_uploads WHERE message_id IN (?) ORDER BY upload_time ASC`,
       [messageIds]
     );
 
-    console.log(`📸 Found ${mediaRows.length} media files`);
+    console.log(`📸 Found ${mediaRows.length} media files for driver`);
 
     const mediaMap = {};
     mediaRows.forEach(media => {
@@ -291,22 +359,78 @@ app.get('/api/messages/:driverId', async (req, res) => {
       });
     });
 
-    const messagesWithMedia = messages.map(message => {
-      const media = mediaMap[message.message_id] || [];
-      if (media.length > 0) {
-        console.log(`📨 Message ${message.message_id} has ${media.length} media files`);
-      }
-      return {
-        ...message,
-        media: media
-      };
-    });
+    const messagesWithMedia = messages.map(message => ({
+      ...message,
+      media: mediaMap[message.message_id] || []
+    }));
 
-    console.log(`✅ Loaded ${messagesWithMedia.length} messages with ${mediaRows.length} media files`);
+    console.log(`✅ Loaded ${messagesWithMedia.length} driver messages with ${mediaRows.length} media files`);
 
     res.json(messagesWithMedia);
   } catch (error) {
-    console.error('❌ Error fetching messages:', error);
+    console.error('❌ Error fetching driver messages:', error);
+    res.status(500).json({ error: 'Failed to fetch messages' });
+  }
+});
+
+// Get messages for customer
+app.get('/api/customer-messages/:customerId', async (req, res) => {
+  try {
+    console.log('📡 Fetching customer messages for:', req.params.customerId);
+
+    const [messages] = await pool.query(
+      `SELECT m.*,
+       CASE
+         WHEN m.sender_type = 'support' THEN 'support'
+         ELSE 'customer'
+       END as sender
+       FROM messages m
+       WHERE m.customer_id = ? AND m.chat_type = 'customer'
+       ORDER BY m.timestamp ASC`,
+      [req.params.customerId]
+    );
+
+    console.log(`📦 Found ${messages.length} customer messages`);
+
+    if (messages.length === 0) {
+      return res.json([]);
+    }
+
+    const messageIds = messages.map(msg => msg.message_id);
+
+    const [mediaRows] = await pool.query(
+      `SELECT * FROM media_uploads WHERE message_id IN (?) ORDER BY upload_time ASC`,
+      [messageIds]
+    );
+
+    console.log(`📸 Found ${mediaRows.length} media files for customer`);
+
+    const mediaMap = {};
+    mediaRows.forEach(media => {
+      if (!mediaMap[media.message_id]) {
+        mediaMap[media.message_id] = [];
+      }
+      mediaMap[media.message_id].push({
+        id: media.id,
+        message_id: media.message_id,
+        customer_id: media.customer_id,
+        file_name: media.file_name,
+        file_url: media.file_url,
+        media_type: media.media_type,
+        upload_time: media.upload_time
+      });
+    });
+
+    const messagesWithMedia = messages.map(message => ({
+      ...message,
+      media: mediaMap[message.message_id] || []
+    }));
+
+    console.log(`✅ Loaded ${messagesWithMedia.length} customer messages with ${mediaRows.length} media files`);
+
+    res.json(messagesWithMedia);
+  } catch (error) {
+    console.error('❌ Error fetching customer messages:', error);
     res.status(500).json({ error: 'Failed to fetch messages' });
   }
 });
@@ -314,7 +438,7 @@ app.get('/api/messages/:driverId', async (req, res) => {
 app.get('/api/debug-media', async (req, res) => {
   try {
     const [mediaRows] = await pool.query('SELECT * FROM media_uploads ORDER BY upload_time DESC LIMIT 10');
-    const [messageRows] = await pool.query('SELECT message_id, driver_id, text FROM messages ORDER BY timestamp DESC LIMIT 10');
+    const [messageRows] = await pool.query('SELECT message_id, driver_id, customer_id, text, chat_type FROM messages ORDER BY timestamp DESC LIMIT 10');
 
     res.json({
       media_uploads: mediaRows,
