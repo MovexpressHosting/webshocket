@@ -7,7 +7,6 @@ const mysql = require('mysql2/promise');
 
 const app = express();
 app.use(cors());
-
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
   cors: {
@@ -109,30 +108,26 @@ io.on('connection', (socket) => {
       ([id, user]) => user.driverId === driverId && user.type === 'user'
     );
     if (driverSocket) {
-      callback(driverSocket[0]); // Return the socket ID
+      callback(driverSocket[0]);
     } else {
-      callback(null); // Driver not found or offline
+      callback(null);
     }
   });
 
   // Handle manual driver disconnection
   socket.on('disconnectUser', (driverId) => {
     console.log('Manual driver disconnection:', driverId);
-    // Find all sockets for this driver
     const driverSockets = Object.entries(users).filter(
       ([id, user]) => user.driverId === driverId && user.type === 'user'
     );
-    // Remove all driver sockets
     driverSockets.forEach(([socketId, user]) => {
       console.log(`Removing driver socket: ${socketId} for driver: ${driverId}`);
       delete users[socketId];
-      // Force disconnect the socket
       const driverSocket = io.sockets.sockets.get(socketId);
       if (driverSocket) {
         driverSocket.disconnect(true);
       }
     });
-    // Update online users list
     const onlineUsers = Object.entries(users).map(([id, user]) => ({
       id,
       name: user.name,
@@ -146,8 +141,6 @@ io.on('connection', (socket) => {
   socket.on('sendMessage', async (message) => {
     console.log('Message received:', message);
     const { id, receiverId, driverId, text, media, sender_type } = message;
-
-    // Use the message.id sent from the client as message_id
     const messageWithTimestamp = {
       message_id: id,
       sender_id: socket.id,
@@ -158,10 +151,10 @@ io.on('connection', (socket) => {
       sender_type: sender_type,
     };
 
+    const connection = await pool.getConnection();
     try {
-      const connection = await pool.getConnection();
+      await connection.beginTransaction();
 
-      // Insert into messages table
       await connection.query(
         'INSERT INTO messages (message_id, sender_id, receiver_id, driver_id, text, timestamp, sender_type) VALUES (?, ?, ?, ?, ?, ?, ?)',
         [
@@ -175,11 +168,10 @@ io.on('connection', (socket) => {
         ]
       );
 
-      // If media is present, insert into media_uploads table
       if (media && media.length > 0) {
         for (const mediaItem of media) {
           await connection.query(
-            'INSERT INTO media_uploads (message_id, driver_id, file_name, file_url, media_type, upload_time, file_size, mime_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            'INSERT IGNORE INTO media_uploads (message_id, driver_id, file_name, file_url, media_type, upload_time, file_size, mime_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
             [
               messageWithTimestamp.message_id,
               messageWithTimestamp.driver_id,
@@ -194,19 +186,20 @@ io.on('connection', (socket) => {
         }
       }
 
-      connection.release();
+      await connection.commit();
     } catch (error) {
+      await connection.rollback();
       console.error('Error saving message or media:', error);
+    } finally {
+      connection.release();
     }
 
-    // Route the message to the correct receiver
     if (receiverId) {
       if (users[receiverId]) {
         io.to(receiverId).emit('receiveMessage', message);
       } else if (receiverId === 'admin') {
         io.to('admin').emit('receiveMessage', message);
       } else if (messageWithTimestamp.driver_id) {
-        // If receiverId is not set but driverId is, find the driver's socket
         const driverSocket = Object.entries(users).find(
           ([id, user]) => user.driverId === messageWithTimestamp.driver_id && user.type === 'user'
         );
@@ -227,9 +220,7 @@ io.on('connection', (socket) => {
       io.emit('adminStatus', false);
       console.log('Admin went offline');
     }
-    // Remove user from tracking
     delete users[socket.id];
-    // Update online users list
     const onlineUsers = Object.entries(users).map(([id, user]) => ({
       id,
       name: user.name,
@@ -244,7 +235,6 @@ io.on('connection', (socket) => {
 // API endpoint to fetch old messages with associated media
 app.get('/api/messages/:driverId', async (req, res) => {
   try {
-    // Fetch messages
     const [messageRows] = await pool.query(
       `SELECT *,
        CASE
@@ -257,8 +247,6 @@ app.get('/api/messages/:driverId', async (req, res) => {
        ORDER BY timestamp ASC`,
       [req.params.driverId]
     );
-
-    // Fetch media for each message
     const messagesWithMedia = await Promise.all(messageRows.map(async (message) => {
       const [mediaRows] = await pool.query(
         'SELECT * FROM media_uploads WHERE message_id = ?',
@@ -269,7 +257,6 @@ app.get('/api/messages/:driverId', async (req, res) => {
         media: mediaRows
       };
     }));
-
     res.json(messagesWithMedia);
   } catch (error) {
     console.error('Error fetching messages:', error);
