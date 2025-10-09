@@ -140,38 +140,47 @@ io.on('connection', (socket) => {
   });
 
   socket.on('sendMessage', async (message) => {
-    console.log('Message received:', message);
-    const { id, receiverId, driverId, text, media, sender_type } = message;
-    const messageWithTimestamp = {
-      message_id: id,
-      sender_id: socket.id,
-      receiver_id: receiverId,
-      driver_id: driverId,
-      text: text || '',
-      timestamp: new Date().toISOString(),
-      sender_type: sender_type,
-    };
+  console.log('Message received:', message);
+  const { id, receiverId, driverId, text, media, sender_type } = message;
+  const messageWithTimestamp = {
+    message_id: id,
+    sender_id: socket.id,
+    receiver_id: receiverId,
+    driver_id: driverId,
+    text: text || '',
+    timestamp: new Date().toISOString(),
+    sender_type: sender_type,
+  };
 
-    let connection;
-    try {
-      connection = await pool.getConnection();
-      // Insert into messages table
-      await connection.query(
-        'INSERT INTO messages (message_id, sender_id, receiver_id, driver_id, text, timestamp, sender_type) VALUES (?, ?, ?, ?, ?, ?, ?)',
-        [
-          messageWithTimestamp.message_id,
-          messageWithTimestamp.sender_id,
-          messageWithTimestamp.receiver_id,
-          messageWithTimestamp.driver_id,
-          messageWithTimestamp.text,
-          messageWithTimestamp.timestamp,
-          messageWithTimestamp.sender_type,
-        ]
-      );
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    
+    // Insert into messages table
+    await connection.query(
+      'INSERT INTO messages (message_id, sender_id, receiver_id, driver_id, text, timestamp, sender_type) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [
+        messageWithTimestamp.message_id,
+        messageWithTimestamp.sender_id,
+        messageWithTimestamp.receiver_id,
+        messageWithTimestamp.driver_id,
+        messageWithTimestamp.text,
+        messageWithTimestamp.timestamp,
+        messageWithTimestamp.sender_type,
+      ]
+    );
 
-      // If media is present, insert into media_uploads table
-      if (media && media.length > 0) {
-        for (const item of media) {
+    // If media is present, check if it already exists before inserting
+    if (media && media.length > 0) {
+      for (const item of media) {
+        // Check if this media item already exists for this message
+        const [existingMedia] = await connection.query(
+          'SELECT id FROM media_uploads WHERE message_id = ? AND file_url = ?',
+          [messageWithTimestamp.message_id, item.file_url]
+        );
+
+        // Only insert if it doesn't exist
+        if (existingMedia.length === 0) {
           await connection.query(
             'INSERT INTO media_uploads (message_id, driver_id, file_name, file_url, media_type, upload_time, file_size, mime_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
             [
@@ -185,32 +194,36 @@ io.on('connection', (socket) => {
               item.mime_type,
             ]
           );
+          console.log('Inserted new media record:', item.file_name);
+        } else {
+          console.log('Media already exists, skipping insert:', item.file_name);
         }
       }
-    } catch (error) {
-      console.error('Error saving message or media:', error);
-    } finally {
-      if (connection) connection.release();
     }
+  } catch (error) {
+    console.error('Error saving message or media:', error);
+  } finally {
+    if (connection) connection.release();
+  }
 
-    // Route the message to the correct receiver
-    if (receiverId) {
-      if (users[receiverId]) {
-        io.to(receiverId).emit('receiveMessage', message);
-      } else if (receiverId === 'admin') {
-        io.to('admin').emit('receiveMessage', message);
-      } else if (messageWithTimestamp.driver_id) {
-        const driverSocket = Object.entries(users).find(
-          ([id, user]) => user.driverId === messageWithTimestamp.driver_id && user.type === 'user'
-        );
-        if (driverSocket) {
-          io.to(driverSocket[0]).emit('receiveMessage', message);
-        }
+  // Rest of your message routing logic remains the same...
+  if (receiverId) {
+    if (users[receiverId]) {
+      io.to(receiverId).emit('receiveMessage', message);
+    } else if (receiverId === 'admin') {
+      io.to('admin').emit('receiveMessage', message);
+    } else if (messageWithTimestamp.driver_id) {
+      const driverSocket = Object.entries(users).find(
+        ([id, user]) => user.driverId === messageWithTimestamp.driver_id && user.type === 'user'
+      );
+      if (driverSocket) {
+        io.to(driverSocket[0]).emit('receiveMessage', message);
       }
-    } else {
-      io.emit('receiveMessage', message);
     }
-  });
+  } else {
+    io.emit('receiveMessage', message);
+  }
+});
 
   socket.on('disconnect', (reason) => {
     console.log('Client disconnected:', socket.id, 'Reason:', reason);
@@ -285,3 +298,4 @@ httpServer.listen(PORT, () => {
   console.log(`- Local:   http://localhost:${PORT}`);
   console.log(`- Network: http://${localIp}:${PORT}`);
 });
+
