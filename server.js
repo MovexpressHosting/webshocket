@@ -7,6 +7,7 @@ const mysql = require('mysql2/promise');
 
 const app = express();
 app.use(cors());
+
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
   cors: {
@@ -31,9 +32,9 @@ const pool = mysql.createPool(dbConfig);
 
 // Track online status and users
 let adminOnline = false;
-const users = {}; // { socketId: { type: 'user'|'admin', name: string, driverId?: string } }
+const users = {}; // { socketId: { type: 'user'|'admin', name: string, driverId?: string, customerId?: string } }
 
-// Create messages table if not exists
+// Initialize database and tables
 async function initializeDatabase() {
   const connection = await pool.getConnection();
   try {
@@ -43,17 +44,19 @@ async function initializeDatabase() {
         message_id VARCHAR(50) NOT NULL,
         sender_id VARCHAR(50) NOT NULL,
         receiver_id VARCHAR(50),
-        driver_id VARCHAR(50) NOT NULL,
+        driver_id VARCHAR(50),
+        customer_id VARCHAR(50),
         text TEXT NOT NULL,
         timestamp DATETIME NOT NULL,
         sender_type ENUM('user', 'support') NOT NULL,
         INDEX (sender_id),
         INDEX (receiver_id),
         INDEX (driver_id),
+        INDEX (customer_id),
         INDEX (timestamp)
       )
     `);
-    console.log("Database initialized");
+    console.log("Database and tables initialized");
   } catch (error) {
     console.error("Database initialization error:", error);
   } finally {
@@ -66,11 +69,12 @@ initializeDatabase();
 io.on('connection', (socket) => {
   console.log('New client connected:', socket.id);
 
-  socket.on('register', (userType, userName, driverId) => {
+  socket.on('register', (userType, userName, userId) => {
     users[socket.id] = {
       type: userType,
       name: userName || `User-${socket.id.slice(0, 4)}`,
-      driverId,
+      driverId: userType === 'user' && userId ? userId : undefined,
+      customerId: userType === 'user' && userId ? userId : undefined,
     };
     console.log(`User registered as ${userType}:`, socket.id, users[socket.id].name);
     socket.join(userType);
@@ -83,6 +87,7 @@ io.on('connection', (socket) => {
       name: user.name,
       type: user.type,
       driverId: user.driverId,
+      customerId: user.customerId,
     }));
     io.emit('onlineUsers', onlineUsers);
   });
@@ -102,39 +107,40 @@ io.on('connection', (socket) => {
   // Handle manual driver disconnection
   socket.on('disconnectUser', (driverId) => {
     console.log('Manual driver disconnection:', driverId);
-    
+
     // Find all sockets for this driver
     const driverSockets = Object.entries(users).filter(
       ([id, user]) => user.driverId === driverId && user.type === 'user'
     );
-    
+
     // Remove all driver sockets
     driverSockets.forEach(([socketId, user]) => {
       console.log(`Removing driver socket: ${socketId} for driver: ${driverId}`);
       delete users[socketId];
-      
+
       // Force disconnect the socket
       const driverSocket = io.sockets.sockets.get(socketId);
       if (driverSocket) {
         driverSocket.disconnect(true);
       }
     });
-    
+
     // Update online users list
     const onlineUsers = Object.entries(users).map(([id, user]) => ({
       id,
       name: user.name,
       type: user.type,
       driverId: user.driverId,
+      customerId: user.customerId,
     }));
     io.emit('onlineUsers', onlineUsers);
-    
+
     console.log(`Driver ${driverId} manually disconnected. Remaining users:`, Object.keys(users).length);
   });
 
   socket.on('sendMessage', async (message) => {
     console.log('Message received:', message);
-    const { receiverId, driverId, ...rest } = message;
+    const { receiverId, driverId, customerId, ...rest } = message;
     const messageWithTimestamp = {
       ...rest,
       id: `msg-${Date.now()}`,
@@ -144,17 +150,18 @@ io.on('connection', (socket) => {
       sender: users[socket.id]?.type === 'admin' ? 'support' : 'user',
       sender_type: users[socket.id]?.type === 'admin' ? 'support' : 'user',
       driverId: message.driverId || users[socket.id]?.driverId,
+      customerId: message.customerId || users[socket.id]?.customerId,
     };
-
     try {
       const connection = await pool.getConnection();
       await connection.query(
-        'INSERT INTO messages (message_id, sender_id, receiver_id, driver_id, text, timestamp, sender_type) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO messages (message_id, sender_id, receiver_id, driver_id, customer_id, text, timestamp, sender_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
         [
           messageWithTimestamp.id,
           socket.id,
           receiverId,
           messageWithTimestamp.driverId,
+          messageWithTimestamp.customerId,
           messageWithTimestamp.text,
           messageWithTimestamp.timestamp,
           messageWithTimestamp.sender_type,
@@ -166,19 +173,27 @@ io.on('connection', (socket) => {
     }
 
     // Route the message to the correct receiver
-    if (receiverId) {
+    if (receiverId === 'admin') {
+      io.to('admin').emit('receiveMessage', messageWithTimestamp);
+    } else if (receiverId) {
       if (users[receiverId]) {
         io.to(receiverId).emit('receiveMessage', messageWithTimestamp);
-      } else if (receiverId === 'admin') {
-        io.to('admin').emit('receiveMessage', messageWithTimestamp);
-      } else if (messageWithTimestamp.driverId) {
-        // If receiverId is not set but driverId is, find the driver's socket
-        const driverSocket = Object.entries(users).find(
-          ([id, user]) => user.driverId === messageWithTimestamp.driverId && user.type === 'user'
-        );
-        if (driverSocket) {
-          io.to(driverSocket[0]).emit('receiveMessage', messageWithTimestamp);
-        }
+      }
+    } else if (messageWithTimestamp.driverId) {
+      // If receiverId is not set but driverId is, find the driver's socket
+      const driverSocket = Object.entries(users).find(
+        ([id, user]) => user.driverId === messageWithTimestamp.driverId && user.type === 'user'
+      );
+      if (driverSocket) {
+        io.to(driverSocket[0]).emit('receiveMessage', messageWithTimestamp);
+      }
+    } else if (messageWithTimestamp.customerId) {
+      // If customerId is set, find the customer's socket
+      const customerSocket = Object.entries(users).find(
+        ([id, user]) => user.customerId === messageWithTimestamp.customerId && user.type === 'user'
+      );
+      if (customerSocket) {
+        io.to(customerSocket[0]).emit('receiveMessage', messageWithTimestamp);
       }
     } else {
       io.emit('receiveMessage', messageWithTimestamp);
@@ -187,33 +202,34 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', (reason) => {
     console.log('Client disconnected:', socket.id, 'Reason:', reason);
-    
+
     const disconnectedUser = users[socket.id];
-    
+
     if (disconnectedUser?.type === 'admin') {
       adminOnline = false;
       io.emit('adminStatus', false);
       console.log('Admin went offline');
     }
-    
+
     // Remove user from tracking
     delete users[socket.id];
-    
+
     // Update online users list
     const onlineUsers = Object.entries(users).map(([id, user]) => ({
       id,
       name: user.name,
       type: user.type,
       driverId: user.driverId,
+      customerId: user.customerId,
     }));
     io.emit('onlineUsers', onlineUsers);
-    
+
     console.log(`User disconnected. Remaining users:`, Object.keys(users).length);
   });
 });
 
-// API endpoint to fetch old messages
-app.get('/api/messages/:driverId', async (req, res) => {
+// API endpoint to fetch old messages for drivers
+app.get('/api/messages/driver/:driverId', async (req, res) => {
   try {
     const [rows] = await pool.query(
       `SELECT *,
@@ -226,6 +242,28 @@ app.get('/api/messages/:driverId', async (req, res) => {
        WHERE driver_id = ?
        ORDER BY timestamp ASC`,
       [req.params.driverId]
+    );
+    res.json(rows);
+  } catch (error) {
+    console.error('Error fetching messages:', error);
+    res.status(500).json({ error: 'Failed to fetch messages' });
+  }
+});
+
+// API endpoint to fetch old messages for customers
+app.get('/api/messages/customer/:customerId', async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT *,
+       CASE
+         WHEN sender_id = 'admin' THEN 'support'
+         ELSE 'user'
+       END as sender,
+       sender_type
+       FROM messages
+       WHERE customer_id = ?
+       ORDER BY timestamp ASC`,
+      [req.params.customerId]
     );
     res.json(rows);
   } catch (error) {
