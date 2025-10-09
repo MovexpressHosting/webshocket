@@ -176,23 +176,7 @@ io.on('connection', (socket) => {
       );
 
       // If media is present, insert into media_uploads table
-      if (media && media.length > 0) {
-        for (const mediaItem of media) {
-          await connection.query(
-            'INSERT INTO media_uploads (message_id, driver_id, file_name, file_url, media_type, upload_time, file_size, mime_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-            [
-              messageWithTimestamp.message_id,
-              messageWithTimestamp.driver_id,
-              mediaItem.file_name,
-              mediaItem.file_url,
-              mediaItem.media_type,
-              new Date().toISOString(),
-              mediaItem.file_size,
-              mediaItem.mime_type,
-            ]
-          );
-        }
-      }
+    
 
       connection.release();
     } catch (error) {
