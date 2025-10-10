@@ -245,9 +245,14 @@ io.on('connection', (socket) => {
   });
 });
 
-// API endpoint to fetch old messages with associated media
+// API endpoint to fetch old messages with associated media and pagination
 app.get('/api/messages/:driverId', async (req, res) => {
   try {
+    const { driverId } = req.params;
+    const page = parseInt(req.query.page) || 0;
+    const limit = parseInt(req.query.limit) || 20;
+    const offset = page * limit;
+
     const [messageRows] = await pool.query(
       `SELECT *,
        CASE
@@ -257,10 +262,15 @@ app.get('/api/messages/:driverId', async (req, res) => {
        sender_type
        FROM messages
        WHERE driver_id = ?
-       ORDER BY timestamp ASC`,
-      [req.params.driverId]
+       ORDER BY timestamp DESC
+       LIMIT ? OFFSET ?`,
+      [driverId, limit, offset]
     );
-    const messagesWithMedia = await Promise.all(messageRows.map(async (message) => {
+
+    // Reverse to get chronological order
+    const chronologicalMessages = messageRows.reverse();
+
+    const messagesWithMedia = await Promise.all(chronologicalMessages.map(async (message) => {
       const [mediaRows] = await pool.query(
         'SELECT * FROM media_uploads WHERE message_id = ?',
         [message.message_id]
@@ -298,4 +308,3 @@ httpServer.listen(PORT, () => {
   console.log(`- Local:   http://localhost:${PORT}`);
   console.log(`- Network: http://${localIp}:${PORT}`);
 });
-
