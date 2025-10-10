@@ -249,41 +249,90 @@ io.on('connection', (socket) => {
 app.get('/api/messages/:driverId', async (req, res) => {
   try {
     const { driverId } = req.params;
-    const page = parseInt(req.query.page) || 0;
-    const limit = parseInt(req.query.limit) || 20;
-    const offset = page * limit;
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const offset = (page - 1) * limit;
 
+    // Get total count of messages for this driver
+    const [countRows] = await pool.query(
+      'SELECT COUNT(*) as total FROM messages WHERE driver_id = ?',
+      [driverId]
+    );
+    const totalMessages = countRows[0].total;
+
+    // Get messages for current page
     const [messageRows] = await pool.query(
-      `SELECT *,
+      `SELECT m.*,
        CASE
-         WHEN sender_id = 'admin' THEN 'support'
+         WHEN m.sender_id = 'admin' THEN 'support'
          ELSE 'user'
        END as sender,
-       sender_type
-       FROM messages
-       WHERE driver_id = ?
-       ORDER BY timestamp DESC
+       m.sender_type,
+       mu.id as media_id,
+       mu.file_name,
+       mu.file_url,
+       mu.media_type,
+       mu.file_size,
+       mu.mime_type
+       FROM messages m
+       LEFT JOIN media_uploads mu ON m.message_id = mu.message_id
+       WHERE m.driver_id = ?
+       ORDER BY m.timestamp DESC
        LIMIT ? OFFSET ?`,
       [driverId, limit, offset]
     );
 
-    // Reverse to get chronological order
-    const chronologicalMessages = messageRows.reverse();
+    // Group messages and their media
+    const messagesMap = new Map();
+    
+    messageRows.forEach(row => {
+      if (!messagesMap.has(row.message_id)) {
+        messagesMap.set(row.message_id, {
+          message_id: row.message_id,
+          sender_id: row.sender_id,
+          receiver_id: row.receiver_id,
+          driver_id: row.driver_id,
+          text: row.text,
+          timestamp: row.timestamp,
+          sender_type: row.sender_type,
+          sender: row.sender,
+          media: []
+        });
+      }
+      
+      // Add media if it exists
+      if (row.file_url) {
+        messagesMap.get(row.message_id).media.push({
+          id: row.media_id,
+          file_name: row.file_name,
+          file_url: row.file_url,
+          media_type: row.media_type,
+          file_size: row.file_size,
+          mime_type: row.mime_type
+        });
+      }
+    });
 
-    const messagesWithMedia = await Promise.all(chronologicalMessages.map(async (message) => {
-      const [mediaRows] = await pool.query(
-        'SELECT * FROM media_uploads WHERE message_id = ?',
-        [message.message_id]
-      );
-      return {
-        ...message,
-        media: mediaRows
-      };
-    }));
-    res.json(messagesWithMedia);
+    const messages = Array.from(messagesMap.values());
+    
+    // Reverse to get chronological order (oldest first)
+    const chronologicalMessages = messages.reverse();
+
+    res.json({
+      success: true,
+      messages: chronologicalMessages,
+      totalMessages: totalMessages,
+      currentPage: page,
+      totalPages: Math.ceil(totalMessages / limit),
+      hasMore: page < Math.ceil(totalMessages / limit)
+    });
   } catch (error) {
     console.error('Error fetching messages:', error);
-    res.status(500).json({ error: 'Failed to fetch messages' });
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to fetch messages',
+      message: error.message 
+    });
   }
 });
 
