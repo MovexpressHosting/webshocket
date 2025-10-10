@@ -1,4 +1,4 @@
-const express = require('express'); // changes
+const express = require('express');
 const { createServer } = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
@@ -13,11 +13,10 @@ const io = new Server(httpServer, {
   cors: {
     origin: "*",
     methods: ["GET", "POST"]
-  },
-  pingTimeout: 60000,
-  pingInterval: 25000
+  }
 });
 
+// MySQL Configuration
 const dbConfig = {
   host: "srv657.hstgr.io",
   user: "u442108067_mydb",
@@ -28,12 +27,14 @@ const dbConfig = {
   queueLimit: 0
 };
 
+// Create MySQL connection pool
 const pool = mysql.createPool(dbConfig);
 
+// Track online status and users
 let adminOnline = false;
-const users = {};
-const driverSockets = new Map();
+const users = {}; // { socketId: { type: 'user'|'admin', name: string, driverId?: string } }
 
+// Create messages table if not exists
 async function initializeDatabase() {
   const connection = await pool.getConnection();
   try {
@@ -87,11 +88,6 @@ io.on('connection', (socket) => {
       name: userName || `User-${socket.id.slice(0, 4)}`,
       driverId,
     };
-    
-    if (userType === 'user' && driverId) {
-      driverSockets.set(driverId, socket.id);
-    }
-    
     console.log(`User registered as ${userType}:`, socket.id, users[socket.id].name);
     socket.join(userType);
     if (userType === 'admin') {
@@ -107,17 +103,19 @@ io.on('connection', (socket) => {
     io.emit('onlineUsers', onlineUsers);
   });
 
+  // New event to get driver's socket ID
   socket.on('getDriverSocketId', (driverId, callback) => {
     const driverSocket = Object.entries(users).find(
       ([id, user]) => user.driverId === driverId && user.type === 'user'
     );
     if (driverSocket) {
-      callback(driverSocket[0]);
+      callback(driverSocket[0]); // Return the socket ID
     } else {
-      callback(null);
+      callback(null); // Driver not found or offline
     }
   });
 
+  // Handle manual driver disconnection
   socket.on('disconnectUser', (driverId) => {
     console.log('Manual driver disconnection:', driverId);
     const driverSockets = Object.entries(users).filter(
@@ -141,7 +139,7 @@ io.on('connection', (socket) => {
     console.log(`Driver ${driverId} manually disconnected. Remaining users:`, Object.keys(users).length);
   });
 
-  socket.on('sendMessage', async (message, callback) => {
+  socket.on('sendMessage', async (message) => {
   console.log('Message received:', message);
   const { id, receiverId, driverId, text, media, sender_type } = message;
   const messageWithTimestamp = {
@@ -158,6 +156,7 @@ io.on('connection', (socket) => {
   try {
     connection = await pool.getConnection();
     
+    // Insert into messages table
     await connection.query(
       'INSERT INTO messages (message_id, sender_id, receiver_id, driver_id, text, timestamp, sender_type) VALUES (?, ?, ?, ?, ?, ?, ?)',
       [
@@ -171,13 +170,16 @@ io.on('connection', (socket) => {
       ]
     );
 
+    // If media is present, check if it already exists before inserting
     if (media && media.length > 0) {
       for (const item of media) {
+        // Check if this media item already exists for this message
         const [existingMedia] = await connection.query(
           'SELECT id FROM media_uploads WHERE message_id = ? AND file_url = ?',
           [messageWithTimestamp.message_id, item.file_url]
         );
 
+        // Only insert if it doesn't exist
         if (existingMedia.length === 0) {
           await connection.query(
             'INSERT INTO media_uploads (message_id, driver_id, file_name, file_url, media_type, upload_time, file_size, mime_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
@@ -198,44 +200,27 @@ io.on('connection', (socket) => {
         }
       }
     }
-
-    if (callback) {
-      callback({ success: true, message: 'Message delivered' });
-    }
   } catch (error) {
     console.error('Error saving message or media:', error);
-    if (callback) {
-      callback({ success: false, error: 'Failed to save message' });
-    }
-    return;
   } finally {
     if (connection) connection.release();
   }
 
-  let messageDelivered = false;
-
+  // Rest of your message routing logic remains the same...
   if (receiverId) {
     if (users[receiverId]) {
       io.to(receiverId).emit('receiveMessage', message);
-      messageDelivered = true;
     } else if (receiverId === 'admin') {
       io.to('admin').emit('receiveMessage', message);
-      messageDelivered = true;
+    } else if (messageWithTimestamp.driver_id) {
+      const driverSocket = Object.entries(users).find(
+        ([id, user]) => user.driverId === messageWithTimestamp.driver_id && user.type === 'user'
+      );
+      if (driverSocket) {
+        io.to(driverSocket[0]).emit('receiveMessage', message);
+      }
     }
-  }
-
-  if (messageWithTimestamp.driver_id) {
-    const driverSocketId = driverSockets.get(messageWithTimestamp.driver_id);
-    if (driverSocketId && users[driverSocketId]) {
-      io.to(driverSocketId).emit('receiveMessage', message);
-      messageDelivered = true;
-      console.log(`Message delivered to driver ${messageWithTimestamp.driver_id} via socket ${driverSocketId}`);
-    } else {
-      console.log(`Driver ${messageWithTimestamp.driver_id} not found online, storing message in database`);
-    }
-  }
-
-  if (!messageDelivered) {
+  } else {
     io.emit('receiveMessage', message);
   }
 });
@@ -243,11 +228,6 @@ io.on('connection', (socket) => {
   socket.on('disconnect', (reason) => {
     console.log('Client disconnected:', socket.id, 'Reason:', reason);
     const disconnectedUser = users[socket.id];
-    
-    if (disconnectedUser?.type === 'user' && disconnectedUser.driverId) {
-      driverSockets.delete(disconnectedUser.driverId);
-    }
-    
     if (disconnectedUser?.type === 'admin') {
       adminOnline = false;
       io.emit('adminStatus', false);
@@ -265,6 +245,7 @@ io.on('connection', (socket) => {
   });
 });
 
+// API endpoint to fetch old messages with associated media
 app.get('/api/messages/:driverId', async (req, res) => {
   try {
     const [messageRows] = await pool.query(
@@ -317,3 +298,4 @@ httpServer.listen(PORT, () => {
   console.log(`- Local:   http://localhost:${PORT}`);
   console.log(`- Network: http://${localIp}:${PORT}`);
 });
+
