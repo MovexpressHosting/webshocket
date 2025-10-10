@@ -32,7 +32,7 @@ const pool = mysql.createPool(dbConfig);
 
 // Track online status and users
 let adminOnline = false;
-const users = {};
+const users = {}; // { socketId: { type: 'user'|'admin', name: string, driverId?: string } }
 
 // Create messages table if not exists
 async function initializeDatabase() {
@@ -47,7 +47,7 @@ async function initializeDatabase() {
         driver_id VARCHAR(50) NOT NULL,
         text TEXT NOT NULL,
         timestamp DATETIME NOT NULL,
-        sender_type ENUM('user', 'support', 'admin') NOT NULL,
+        sender_type ENUM('user', 'support') NOT NULL,
         INDEX (sender_id),
         INDEX (receiver_id),
         INDEX (driver_id),
@@ -103,42 +103,84 @@ io.on('connection', (socket) => {
     io.emit('onlineUsers', onlineUsers);
   });
 
+  // New event to get driver's socket ID
+  socket.on('getDriverSocketId', (driverId, callback) => {
+    const driverSocket = Object.entries(users).find(
+      ([id, user]) => user.driverId === driverId && user.type === 'user'
+    );
+    if (driverSocket) {
+      callback(driverSocket[0]); // Return the socket ID
+    } else {
+      callback(null); // Driver not found or offline
+    }
+  });
+
+  // Handle manual driver disconnection
+  socket.on('disconnectUser', (driverId) => {
+    console.log('Manual driver disconnection:', driverId);
+    const driverSockets = Object.entries(users).filter(
+      ([id, user]) => user.driverId === driverId && user.type === 'user'
+    );
+    driverSockets.forEach(([socketId, user]) => {
+      console.log(`Removing driver socket: ${socketId} for driver: ${driverId}`);
+      delete users[socketId];
+      const driverSocket = io.sockets.sockets.get(socketId);
+      if (driverSocket) {
+        driverSocket.disconnect(true);
+      }
+    });
+    const onlineUsers = Object.entries(users).map(([id, user]) => ({
+      id,
+      name: user.name,
+      type: user.type,
+      driverId: user.driverId,
+    }));
+    io.emit('onlineUsers', onlineUsers);
+    console.log(`Driver ${driverId} manually disconnected. Remaining users:`, Object.keys(users).length);
+  });
+
   socket.on('sendMessage', async (message) => {
-    console.log('Message received:', message);
-    const { id, receiverId, driverId, text, media, sender_type } = message;
-    
-    const dbSenderType = sender_type === 'support' ? 'support' : 
-                        sender_type === 'admin' ? 'admin' : 'user';
-    
-    const messageWithTimestamp = {
-      message_id: id,
-      sender_id: socket.id,
-      receiver_id: receiverId,
-      driver_id: driverId,
-      text: text || '',
-      timestamp: new Date().toISOString(),
-      sender_type: dbSenderType,
-    };
+  console.log('Message received:', message);
+  const { id, receiverId, driverId, text, media, sender_type } = message;
+  const messageWithTimestamp = {
+    message_id: id,
+    sender_id: socket.id,
+    receiver_id: receiverId,
+    driver_id: driverId,
+    text: text || '',
+    timestamp: new Date().toISOString(),
+    sender_type: sender_type,
+  };
 
-    let connection;
-    try {
-      connection = await pool.getConnection();
-      
-      await connection.query(
-        'INSERT INTO messages (message_id, sender_id, receiver_id, driver_id, text, timestamp, sender_type) VALUES (?, ?, ?, ?, ?, ?, ?)',
-        [
-          messageWithTimestamp.message_id,
-          messageWithTimestamp.sender_id,
-          messageWithTimestamp.receiver_id,
-          messageWithTimestamp.driver_id,
-          messageWithTimestamp.text,
-          messageWithTimestamp.timestamp,
-          messageWithTimestamp.sender_type,
-        ]
-      );
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    
+    // Insert into messages table
+    await connection.query(
+      'INSERT INTO messages (message_id, sender_id, receiver_id, driver_id, text, timestamp, sender_type) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [
+        messageWithTimestamp.message_id,
+        messageWithTimestamp.sender_id,
+        messageWithTimestamp.receiver_id,
+        messageWithTimestamp.driver_id,
+        messageWithTimestamp.text,
+        messageWithTimestamp.timestamp,
+        messageWithTimestamp.sender_type,
+      ]
+    );
 
-      if (media && media.length > 0) {
-        for (const item of media) {
+    // If media is present, check if it already exists before inserting
+    if (media && media.length > 0) {
+      for (const item of media) {
+        // Check if this media item already exists for this message
+        const [existingMedia] = await connection.query(
+          'SELECT id FROM media_uploads WHERE message_id = ? AND file_url = ?',
+          [messageWithTimestamp.message_id, item.file_url]
+        );
+
+        // Only insert if it doesn't exist
+        if (existingMedia.length === 0) {
           await connection.query(
             'INSERT INTO media_uploads (message_id, driver_id, file_name, file_url, media_type, upload_time, file_size, mime_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
             [
@@ -152,33 +194,36 @@ io.on('connection', (socket) => {
               item.mime_type,
             ]
           );
+          console.log('Inserted new media record:', item.file_name);
+        } else {
+          console.log('Media already exists, skipping insert:', item.file_name);
         }
       }
-    } catch (error) {
-      console.error('Error saving message or media:', error);
-    } finally {
-      if (connection) connection.release();
     }
+  } catch (error) {
+    console.error('Error saving message or media:', error);
+  } finally {
+    if (connection) connection.release();
+  }
 
-    if (driverId) {
-      const driverSockets = Object.entries(users).filter(
-        ([id, user]) => user.driverId === driverId && user.type === 'user'
+  // Rest of your message routing logic remains the same...
+  if (receiverId) {
+    if (users[receiverId]) {
+      io.to(receiverId).emit('receiveMessage', message);
+    } else if (receiverId === 'admin') {
+      io.to('admin').emit('receiveMessage', message);
+    } else if (messageWithTimestamp.driver_id) {
+      const driverSocket = Object.entries(users).find(
+        ([id, user]) => user.driverId === messageWithTimestamp.driver_id && user.type === 'user'
       );
-      
-      driverSockets.forEach(([socketId, user]) => {
-        io.to(socketId).emit('receiveMessage', message);
-      });
-      
-      if (sender_type === 'user') {
-        const adminSockets = Object.entries(users).filter(
-          ([id, user]) => user.type === 'admin'
-        );
-        adminSockets.forEach(([socketId, user]) => {
-          io.to(socketId).emit('receiveMessage', message);
-        });
+      if (driverSocket) {
+        io.to(driverSocket[0]).emit('receiveMessage', message);
       }
     }
-  });
+  } else {
+    io.emit('receiveMessage', message);
+  }
+});
 
   socket.on('disconnect', (reason) => {
     console.log('Client disconnected:', socket.id, 'Reason:', reason);
@@ -186,6 +231,7 @@ io.on('connection', (socket) => {
     if (disconnectedUser?.type === 'admin') {
       adminOnline = false;
       io.emit('adminStatus', false);
+      console.log('Admin went offline');
     }
     delete users[socket.id];
     const onlineUsers = Object.entries(users).map(([id, user]) => ({
@@ -195,99 +241,39 @@ io.on('connection', (socket) => {
       driverId: user.driverId,
     }));
     io.emit('onlineUsers', onlineUsers);
+    console.log(`User disconnected. Remaining users:`, Object.keys(users).length);
   });
 });
 
-// FIXED API endpoint - simplified and more robust
+// API endpoint to fetch old messages with associated media
 app.get('/api/messages/:driverId', async (req, res) => {
   try {
-    const { driverId } = req.params;
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 10;
-    const offset = (page - 1) * limit;
-
-    console.log(`Fetching messages for driver: ${driverId}, page: ${page}`);
-
-    // Get messages
     const [messageRows] = await pool.query(
-      `SELECT 
-        m.message_id as id,
-        m.message_id,
-        m.sender_id,
-        m.receiver_id,
-        m.driver_id,
-        m.text,
-        m.timestamp,
-        m.sender_type,
-        mu.file_name,
-        mu.file_url,
-        mu.media_type,
-        mu.file_size,
-        mu.mime_type
-      FROM messages m
-      LEFT JOIN media_uploads mu ON m.message_id = mu.message_id
-      WHERE m.driver_id = ?
-      ORDER BY m.timestamp ASC
-      LIMIT ? OFFSET ?`,
-      [driverId, limit, offset]
+      `SELECT *,
+       CASE
+         WHEN sender_id = 'admin' THEN 'support'
+         ELSE 'user'
+       END as sender,
+       sender_type
+       FROM messages
+       WHERE driver_id = ?
+       ORDER BY timestamp ASC`,
+      [req.params.driverId]
     );
-
-    console.log(`Found ${messageRows.length} messages`);
-
-    // Group messages with their media
-    const messagesMap = new Map();
-    
-    messageRows.forEach(row => {
-      if (!messagesMap.has(row.id)) {
-        messagesMap.set(row.id, {
-          id: row.id,
-          message_id: row.message_id,
-          sender_id: row.sender_id,
-          receiver_id: row.receiver_id,
-          driver_id: row.driver_id,
-          text: row.text,
-          timestamp: row.timestamp,
-          sender_type: row.sender_type,
-          media: []
-        });
-      }
-      
-      if (row.file_url) {
-        messagesMap.get(row.id).media.push({
-          file_name: row.file_name,
-          file_url: row.file_url,
-          media_type: row.media_type,
-          file_size: row.file_size,
-          mime_type: row.mime_type
-        });
-      }
-    });
-
-    const messages = Array.from(messagesMap.values());
-    
-    // Get total count
-    const [countRows] = await pool.query(
-      'SELECT COUNT(DISTINCT message_id) as total FROM messages WHERE driver_id = ?',
-      [driverId]
-    );
-    const totalMessages = countRows[0].total;
-
-    res.json({
-      success: true,
-      messages: messages,
-      totalMessages: totalMessages,
-      currentPage: page,
-      totalPages: Math.ceil(totalMessages / limit),
-      hasMore: page < Math.ceil(totalMessages / limit)
-    });
-
+    const messagesWithMedia = await Promise.all(messageRows.map(async (message) => {
+      const [mediaRows] = await pool.query(
+        'SELECT * FROM media_uploads WHERE message_id = ?',
+        [message.message_id]
+      );
+      return {
+        ...message,
+        media: mediaRows
+      };
+    }));
+    res.json(messagesWithMedia);
   } catch (error) {
     console.error('Error fetching messages:', error);
-    res.status(500).json({ 
-      success: false,
-      error: 'Failed to fetch messages',
-      message: error.message 
-    });
+    res.status(500).json({ error: 'Failed to fetch messages' });
   }
 });
 
@@ -312,3 +298,4 @@ httpServer.listen(PORT, () => {
   console.log(`- Local:   http://localhost:${PORT}`);
   console.log(`- Network: http://${localIp}:${PORT}`);
 });
+
