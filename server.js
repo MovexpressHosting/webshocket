@@ -32,7 +32,7 @@ const pool = mysql.createPool(dbConfig);
 
 // Track online status and users
 let adminOnline = false;
-const users = {}; // { socketId: { type: 'user'|'admin', name: string, driverId?: string } }
+const users = {};
 
 // Create messages table if not exists
 async function initializeDatabase() {
@@ -107,7 +107,6 @@ io.on('connection', (socket) => {
     console.log('Message received:', message);
     const { id, receiverId, driverId, text, media, sender_type } = message;
     
-    // Determine the actual sender type for database
     const dbSenderType = sender_type === 'support' ? 'support' : 
                         sender_type === 'admin' ? 'admin' : 'user';
     
@@ -125,7 +124,6 @@ io.on('connection', (socket) => {
     try {
       connection = await pool.getConnection();
       
-      // Insert into messages table
       await connection.query(
         'INSERT INTO messages (message_id, sender_id, receiver_id, driver_id, text, timestamp, sender_type) VALUES (?, ?, ?, ?, ?, ?, ?)',
         [
@@ -139,7 +137,6 @@ io.on('connection', (socket) => {
         ]
       );
 
-      // If media is present, insert media
       if (media && media.length > 0) {
         for (const item of media) {
           await connection.query(
@@ -155,7 +152,6 @@ io.on('connection', (socket) => {
               item.mime_type,
             ]
           );
-          console.log('Inserted media record:', item.file_name);
         }
       }
     } catch (error) {
@@ -164,19 +160,15 @@ io.on('connection', (socket) => {
       if (connection) connection.release();
     }
 
-    // Route message to appropriate recipients
     if (driverId) {
-      // Find all driver sockets with this driverId
       const driverSockets = Object.entries(users).filter(
         ([id, user]) => user.driverId === driverId && user.type === 'user'
       );
       
-      // Send to all driver instances
       driverSockets.forEach(([socketId, user]) => {
         io.to(socketId).emit('receiveMessage', message);
       });
       
-      // Also send to admin if admin sent the message
       if (sender_type === 'user') {
         const adminSockets = Object.entries(users).filter(
           ([id, user]) => user.type === 'admin'
@@ -194,7 +186,6 @@ io.on('connection', (socket) => {
     if (disconnectedUser?.type === 'admin') {
       adminOnline = false;
       io.emit('adminStatus', false);
-      console.log('Admin went offline');
     }
     delete users[socket.id];
     const onlineUsers = Object.entries(users).map(([id, user]) => ({
@@ -204,11 +195,10 @@ io.on('connection', (socket) => {
       driverId: user.driverId,
     }));
     io.emit('onlineUsers', onlineUsers);
-    console.log(`User disconnected. Remaining users:`, Object.keys(users).length);
   });
 });
 
-// API endpoint to fetch old messages with associated media and pagination
+// FIXED API endpoint - simplified and more robust
 app.get('/api/messages/:driverId', async (req, res) => {
   try {
     const { driverId } = req.params;
@@ -216,37 +206,41 @@ app.get('/api/messages/:driverId', async (req, res) => {
     const limit = parseInt(req.query.limit) || 10;
     const offset = (page - 1) * limit;
 
-    // Get total count of messages for this driver
-    const [countRows] = await pool.query(
-      'SELECT COUNT(*) as total FROM messages WHERE driver_id = ?',
-      [driverId]
-    );
-    const totalMessages = countRows[0].total;
+    console.log(`Fetching messages for driver: ${driverId}, page: ${page}`);
 
-    // Get messages for current page
+    // Get messages
     const [messageRows] = await pool.query(
-      `SELECT m.*,
-       mu.id as media_id,
-       mu.file_name,
-       mu.file_url,
-       mu.media_type,
-       mu.file_size,
-       mu.mime_type
-       FROM messages m
-       LEFT JOIN media_uploads mu ON m.message_id = mu.message_id
-       WHERE m.driver_id = ?
-       ORDER BY m.timestamp DESC
-       LIMIT ? OFFSET ?`,
+      `SELECT 
+        m.message_id as id,
+        m.message_id,
+        m.sender_id,
+        m.receiver_id,
+        m.driver_id,
+        m.text,
+        m.timestamp,
+        m.sender_type,
+        mu.file_name,
+        mu.file_url,
+        mu.media_type,
+        mu.file_size,
+        mu.mime_type
+      FROM messages m
+      LEFT JOIN media_uploads mu ON m.message_id = mu.message_id
+      WHERE m.driver_id = ?
+      ORDER BY m.timestamp ASC
+      LIMIT ? OFFSET ?`,
       [driverId, limit, offset]
     );
 
-    // Group messages and their media
+    console.log(`Found ${messageRows.length} messages`);
+
+    // Group messages with their media
     const messagesMap = new Map();
     
     messageRows.forEach(row => {
-      if (!messagesMap.has(row.message_id)) {
-        messagesMap.set(row.message_id, {
-          id: row.message_id,
+      if (!messagesMap.has(row.id)) {
+        messagesMap.set(row.id, {
+          id: row.id,
           message_id: row.message_id,
           sender_id: row.sender_id,
           receiver_id: row.receiver_id,
@@ -258,10 +252,8 @@ app.get('/api/messages/:driverId', async (req, res) => {
         });
       }
       
-      // Add media if it exists
       if (row.file_url) {
-        messagesMap.get(row.message_id).media.push({
-          id: row.media_id,
+        messagesMap.get(row.id).media.push({
           file_name: row.file_name,
           file_url: row.file_url,
           media_type: row.media_type,
@@ -273,17 +265,22 @@ app.get('/api/messages/:driverId', async (req, res) => {
 
     const messages = Array.from(messagesMap.values());
     
-    // Reverse to get chronological order (oldest first)
-    const chronologicalMessages = messages.reverse();
+    // Get total count
+    const [countRows] = await pool.query(
+      'SELECT COUNT(DISTINCT message_id) as total FROM messages WHERE driver_id = ?',
+      [driverId]
+    );
+    const totalMessages = countRows[0].total;
 
     res.json({
       success: true,
-      messages: chronologicalMessages,
+      messages: messages,
       totalMessages: totalMessages,
       currentPage: page,
       totalPages: Math.ceil(totalMessages / limit),
       hasMore: page < Math.ceil(totalMessages / limit)
     });
+
   } catch (error) {
     console.error('Error fetching messages:', error);
     res.status(500).json({ 
