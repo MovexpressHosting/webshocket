@@ -31,11 +31,8 @@ const dbConfig = {
   password: "mOhe6ln0iP>",
   database: "u442108067_mydb",
   waitForConnections: true,
-  connectionLimit: 20,
-  acquireTimeout: 60000,
-  timeout: 60000,
-  queueLimit: 0,
-  reconnect: true
+  connectionLimit: 10,
+  queueLimit: 0
 };
 
 // Create MySQL connection pool
@@ -45,99 +42,9 @@ const pool = mysql.createPool(dbConfig);
 let adminOnline = false;
 const users = {}; // { socketId: { type: 'user'|'admin', name: string, driverId?: string } }
 
-// Create messages table if not exists
-async function initializeDatabase() {
-  const connection = await pool.getConnection();
-  try {
-    await connection.query(`
-      CREATE TABLE IF NOT EXISTS messages (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        message_id VARCHAR(50) NOT NULL UNIQUE,
-        sender_id VARCHAR(50) NOT NULL,
-        receiver_id VARCHAR(50),
-        driver_id VARCHAR(50) NOT NULL,
-        text TEXT NOT NULL,
-        timestamp DATETIME NOT NULL,
-        sender_type ENUM('user', 'support') NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        INDEX idx_message_id (message_id),
-        INDEX idx_sender_id (sender_id),
-        INDEX idx_driver_id (driver_id),
-        INDEX idx_timestamp (timestamp)
-      )
-    `);
-    await connection.query(`
-      CREATE TABLE IF NOT EXISTS media_uploads (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        message_id VARCHAR(50) NOT NULL,
-        driver_id VARCHAR(50) NOT NULL,
-        file_name VARCHAR(255) NOT NULL,
-        file_url VARCHAR(500) NOT NULL,
-        media_type ENUM('image', 'video', 'gif', 'file') NOT NULL,
-        upload_time DATETIME NOT NULL,
-        file_size INT,
-        mime_type VARCHAR(100),
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        INDEX idx_message_id (message_id),
-        INDEX idx_driver_id (driver_id)
-      )
-    `);
-    console.log('Database tables initialized successfully');
-  } catch (error) {
-    console.error("Database initialization error:", error);
-  } finally {
-    connection.release();
-  }
-}
-
-initializeDatabase();
-
-// Improved message saving function with better error handling
-async function saveMessageToDatabase(message) {
-  const { id, sender_id, receiver_id, driver_id, text, timestamp, sender_type, media = [] } = message;
-  
-  let connection;
-  try {
-    connection = await pool.getConnection();
-    await connection.beginTransaction();
-
-    // Insert into messages table
-    const [messageResult] = await connection.query(
-      'INSERT INTO messages (message_id, sender_id, receiver_id, driver_id, text, timestamp, sender_type) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [id, sender_id, receiver_id, driver_id, text, timestamp, sender_type]
-    );
-
-    // Save media files if any
-    if (media && media.length > 0) {
-      for (const item of media) {
-        await connection.query(
-          'INSERT INTO media_uploads (message_id, driver_id, file_name, file_url, media_type, upload_time, file_size, mime_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-          [id, driver_id, item.file_name, item.file_url, item.media_type, timestamp, item.file_size, item.mime_type]
-        );
-      }
-    }
-
-    await connection.commit();
-    console.log(`✅ Message saved to database: ${id}`);
-    return true;
-  } catch (error) {
-    if (connection) {
-      await connection.rollback();
-    }
-    
-    if (error.code === 'ER_DUP_ENTRY') {
-      console.log(`⚠️ Message already exists: ${id}`);
-      return true; // Consider duplicate as success
-    }
-    
-    console.error('❌ Error saving message to database:', error);
-    return false;
-  } finally {
-    if (connection) {
-      connection.release();
-    }
-  }
-}
+// Track online status and users
+let adminOnline = false;
+const users = {}; // { socketId: { type: 'user'|'admin', name: string, driverId?: string } }
 
 // Add message deletion event handler
 io.on('connection', (socket) => {
@@ -206,8 +113,6 @@ io.on('connection', (socket) => {
       
       const connection = await pool.getConnection();
       try {
-        await connection.beginTransaction();
-        
         // Delete from messages table
         const [messageResult] = await connection.query(
           'DELETE FROM messages WHERE message_id = ? AND driver_id = ?',
@@ -220,16 +125,12 @@ io.on('connection', (socket) => {
           [messageId]
         );
         
-        await connection.commit();
         console.log(`Message deleted from database: ${messageId}`);
         
         // Emit event to all clients to remove the message
         io.emit('messageDeleted', messageId);
         console.log(`Message deleted event emitted: ${messageId}`);
         
-      } catch (error) {
-        await connection.rollback();
-        throw error;
       } finally {
         connection.release();
       }
@@ -248,7 +149,6 @@ io.on('connection', (socket) => {
       text: text || '',
       timestamp: new Date().toISOString(),
       sender_type: sender_type,
-      media: media || []
     };
 
     // Log sent message
@@ -256,21 +156,56 @@ io.on('connection', (socket) => {
     const senderName = senderInfo ? senderInfo.name : 'Unknown';
     console.log(`📤 Message SENT from ${senderName} (${sender_type}):`, text || '[Media message]');
 
-    // Save message to database (non-blocking)
-    saveMessageToDatabase({
-      id: messageWithTimestamp.message_id,
-      sender_id: messageWithTimestamp.sender_id,
-      receiver_id: messageWithTimestamp.receiver_id,
-      driver_id: messageWithTimestamp.driver_id,
-      text: messageWithTimestamp.text,
-      timestamp: messageWithTimestamp.timestamp,
-      sender_type: messageWithTimestamp.sender_type,
-      media: messageWithTimestamp.media
-    }).then(success => {
-      if (!success) {
-        console.error('Failed to save message to database:', messageWithTimestamp.message_id);
+    let connection;
+    try {
+      connection = await pool.getConnection();
+      
+      // Insert into messages table
+      await connection.query(
+        'INSERT INTO messages (message_id, sender_id, receiver_id, driver_id, text, timestamp, sender_type) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [
+          messageWithTimestamp.message_id,
+          messageWithTimestamp.sender_id,
+          messageWithTimestamp.receiver_id,
+          messageWithTimestamp.driver_id,
+          messageWithTimestamp.text,
+          messageWithTimestamp.timestamp,
+          messageWithTimestamp.sender_type,
+        ]
+      );
+
+      // If media is present, check if it already exists before inserting
+      if (media && media.length > 0) {
+        for (const item of media) {
+          // Check if this media item already exists for this message
+          const [existingMedia] = await connection.query(
+            'SELECT id FROM media_uploads WHERE message_id = ? AND file_url = ?',
+            [messageWithTimestamp.message_id, item.file_url]
+          );
+
+          // Only insert if it doesn't exist
+          if (existingMedia.length === 0) {
+            await connection.query(
+              'INSERT INTO media_uploads (message_id, driver_id, file_name, file_url, media_type, upload_time, file_size, mime_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+              [
+                messageWithTimestamp.message_id,
+                messageWithTimestamp.driver_id,
+                item.file_name,
+                item.file_url,
+                item.media_type,
+                messageWithTimestamp.timestamp,
+                item.file_size,
+                item.mime_type,
+              ]
+            );
+          }
+        }
       }
-    });
+    } catch (error) {
+      console.error('Error saving message or media:', error);
+    } finally {
+      if (connection) connection.release();
+    }
 
     // Message routing logic
     if (receiverId) {
@@ -409,8 +344,6 @@ app.delete('/api/messages/:messageId', async (req, res) => {
     
     const connection = await pool.getConnection();
     try {
-      await connection.beginTransaction();
-      
       // Delete from messages table
       const [messageResult] = await connection.query(
         'DELETE FROM messages WHERE message_id = ?',
@@ -423,16 +356,12 @@ app.delete('/api/messages/:messageId', async (req, res) => {
         [messageId]
       );
       
-      await connection.commit();
       console.log(`API: Message deleted successfully: ${messageId}`);
       res.json({ 
         success: true, 
         message: 'Message deleted successfully',
         deletedId: messageId 
       });
-    } catch (error) {
-      await connection.rollback();
-      throw error;
     } finally {
       connection.release();
     }
@@ -476,18 +405,6 @@ app.get('/api/test-db', async (req, res) => {
     });
   }
 });
-
-// Database connection monitoring
-setInterval(async () => {
-  try {
-    const connection = await pool.getConnection();
-    const [rows] = await connection.query('SELECT COUNT(*) as connectionCount FROM information_schema.processlist WHERE db = ?', [dbConfig.database]);
-    connection.release();
-    console.log(`Database connections: ${rows[0].connectionCount}`);
-  } catch (error) {
-    console.error('Database monitoring error:', error);
-  }
-}, 30000);
 
 function getLocalIpAddress() {
   const interfaces = os.networkInterfaces();
