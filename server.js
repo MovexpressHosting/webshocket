@@ -42,6 +42,51 @@ const pool = mysql.createPool(dbConfig);
 let adminOnline = false;
 const users = {}; // { socketId: { type: 'user'|'admin', name: string, driverId?: string } }
 
+// Create messages table if not exists
+async function initializeDatabase() {
+  const connection = await pool.getConnection();
+  try {
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS messages (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        message_id VARCHAR(50) NOT NULL,
+        sender_id VARCHAR(50) NOT NULL,
+        receiver_id VARCHAR(50),
+        driver_id VARCHAR(50) NOT NULL,
+        text TEXT NOT NULL,
+        timestamp DATETIME NOT NULL,
+        sender_type ENUM('user', 'support') NOT NULL,
+        INDEX (sender_id),
+        INDEX (receiver_id),
+        INDEX (driver_id),
+        INDEX (timestamp)
+      )
+    `);
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS media_uploads (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        message_id VARCHAR(50) NOT NULL,
+        driver_id VARCHAR(50) NOT NULL,
+        file_name VARCHAR(255) NOT NULL,
+        file_url VARCHAR(255) NOT NULL,
+        media_type ENUM('image', 'video', 'gif', 'file') NOT NULL,
+        upload_time DATETIME NOT NULL,
+        file_size INT,
+        mime_type VARCHAR(100),
+        INDEX (message_id),
+        INDEX (driver_id)
+      )
+    `);
+    console.log('Database tables initialized successfully');
+  } catch (error) {
+    console.error("Database initialization error:", error);
+  } finally {
+    connection.release();
+  }
+}
+
+initializeDatabase();
+
 // Add message deletion event handler
 io.on('connection', (socket) => {
   console.log(`User connected: ${socket.id}`);
