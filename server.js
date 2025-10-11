@@ -31,8 +31,11 @@ const dbConfig = {
   password: "mOhe6ln0iP>",
   database: "u442108067_mydb",
   waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0
+  connectionLimit: 20, // Increased from 10
+  queueLimit: 0,
+  acquireTimeout: 60000, // 60 seconds
+  timeout: 60000, // 60 seconds
+  reconnect: true
 };
 
 // Create MySQL connection pool
@@ -41,6 +44,9 @@ const pool = mysql.createPool(dbConfig);
 // Track online status and users
 let adminOnline = false;
 const users = {}; // { socketId: { type: 'user'|'admin', name: string, driverId?: string } }
+
+// Message queue for handling rapid messages
+const messageQueue = new Map(); // { socketId: [] }
 
 // Create messages table if not exists
 async function initializeDatabase() {
@@ -55,7 +61,7 @@ async function initializeDatabase() {
         driver_id VARCHAR(50) NOT NULL,
         text TEXT NOT NULL,
         timestamp DATETIME NOT NULL,
-        sender_type ENUM('user', 'support') NOT NULL,
+        sender_type ENUM('user', 'support', 'admin') NOT NULL,
         INDEX (sender_id),
         INDEX (receiver_id),
         INDEX (driver_id),
@@ -87,9 +93,143 @@ async function initializeDatabase() {
 
 initializeDatabase();
 
-// Add message deletion event handler
+// Database connection event handlers
+pool.on('connection', (connection) => {
+  console.log('🔵 New database connection established');
+});
+
+pool.on('acquire', (connection) => {
+  console.log('🔵 Connection acquired');
+});
+
+pool.on('release', (connection) => {
+  console.log('🔴 Connection released');
+});
+
+pool.on('error', (err) => {
+  console.error('❌ Database pool error:', err);
+});
+
+// Message queue processing function
+async function processMessageQueue(socketId) {
+  if (!messageQueue.has(socketId) || messageQueue.get(socketId).length === 0) {
+    return;
+  }
+
+  const queue = messageQueue.get(socketId);
+  const messageData = queue[0];
+
+  console.log(`🔄 Processing message from queue: ${messageData.message_id}, Queue length: ${queue.length}`);
+
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    console.log(`🔵 Database connection acquired for message: ${messageData.message_id}`);
+
+    await connection.beginTransaction();
+
+    // Insert into messages table
+    const [messageResult] = await connection.query(
+      'INSERT INTO messages (message_id, sender_id, receiver_id, driver_id, text, timestamp, sender_type) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [
+        messageData.message_id,
+        messageData.sender_id,
+        messageData.receiver_id,
+        messageData.driver_id,
+        messageData.text,
+        messageData.timestamp,
+        messageData.sender_type,
+      ]
+    );
+
+    console.log(`✅ Message saved to database: ${messageData.message_id}`);
+
+    // If media is present, insert media records
+    if (messageData.media && messageData.media.length > 0) {
+      for (const item of messageData.media) {
+        await connection.query(
+          'INSERT INTO media_uploads (message_id, driver_id, file_name, file_url, media_type, upload_time, file_size, mime_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+          [
+            messageData.message_id,
+            messageData.driver_id,
+            item.file_name,
+            item.file_url,
+            item.media_type,
+            messageData.timestamp,
+            item.file_size,
+            item.mime_type,
+          ]
+        );
+        console.log(`✅ Media saved for message: ${messageData.message_id} - ${item.file_name}`);
+      }
+    }
+
+    // Commit the transaction
+    await connection.commit();
+    console.log(`✅ Transaction committed for message: ${messageData.message_id}`);
+
+    // Remove from queue and emit to clients
+    queue.shift();
+    
+    // Emit the original message to clients
+    const receiverId = messageData.receiver_id;
+    const driverId = messageData.driver_id;
+    const originalMessage = messageData.originalMessage;
+
+    // Message routing logic
+    if (receiverId) {
+      if (users[receiverId]) {
+        io.to(receiverId).emit('receiveMessage', originalMessage);
+        const receiverInfo = users[receiverId];
+        console.log(`📨 Message DELIVERED to ${receiverInfo.name} (${receiverInfo.type})`);
+      } else if (receiverId === 'admin') {
+        io.to('admin').emit('receiveMessage', originalMessage);
+        console.log(`📨 Message DELIVERED to Admin`);
+      } else if (driverId) {
+        const driverSocket = Object.entries(users).find(
+          ([id, user]) => user.driverId === driverId && user.type === 'user'
+        );
+        if (driverSocket) {
+          io.to(driverSocket[0]).emit('receiveMessage', originalMessage);
+          console.log(`📨 Message DELIVERED to Driver ${driverId}`);
+        }
+      }
+    } else {
+      io.emit('receiveMessage', originalMessage);
+      console.log(`📨 Message BROADCASTED to all users`);
+    }
+
+  } catch (error) {
+    console.error('❌ Error processing message from queue:', error);
+    
+    // Rollback transaction in case of error
+    if (connection) {
+      await connection.rollback();
+    }
+    
+    // Retry the same message after a delay
+    console.log(`🔄 Retrying message: ${messageData.message_id} after 500ms`);
+    setTimeout(() => processMessageQueue(socketId), 500);
+    return;
+  } finally {
+    // Always release the connection back to the pool
+    if (connection) {
+      connection.release();
+      console.log(`🔴 Database connection released for message: ${messageData.message_id}`);
+    }
+  }
+
+  // Process next message in queue after a small delay
+  if (queue.length > 0) {
+    setTimeout(() => processMessageQueue(socketId), 50);
+  } else {
+    console.log(`✅ Message queue empty for socket: ${socketId}`);
+  }
+}
+
+// Socket.io connection handling
 io.on('connection', (socket) => {
-  console.log(`User connected: ${socket.id}`);
+  console.log(`🔗 User connected: ${socket.id}`);
 
   socket.on('register', (userType, userName, driverId) => {
     users[socket.id] = {
@@ -101,7 +241,7 @@ io.on('connection', (socket) => {
     if (userType === 'admin') {
       adminOnline = true;
       io.emit('adminStatus', true);
-      console.log('Admin registered and online');
+      console.log('👑 Admin registered and online');
     }
     const onlineUsers = Object.entries(users).map(([id, user]) => ({
       id,
@@ -110,7 +250,7 @@ io.on('connection', (socket) => {
       driverId: user.driverId,
     }));
     io.emit('onlineUsers', onlineUsers);
-    console.log(`User registered: ${userName} (${userType})`);
+    console.log(`✅ User registered: ${userName} (${userType})`);
   });
 
   // New event to get driver's socket ID
@@ -144,13 +284,13 @@ io.on('connection', (socket) => {
       driverId: user.driverId,
     }));
     io.emit('onlineUsers', onlineUsers);
-    console.log(`User manually disconnected: ${driverId}`);
+    console.log(`🔴 User manually disconnected: ${driverId}`);
   });
 
   // Handle message deletion
   socket.on('deleteMessage', async (messageId, driverId) => {
     try {
-      console.log(`Deleting message: ${messageId} for driver: ${driverId}`);
+      console.log(`🗑️ Deleting message: ${messageId} for driver: ${driverId}`);
       
       const connection = await pool.getConnection();
       try {
@@ -166,22 +306,24 @@ io.on('connection', (socket) => {
           [messageId]
         );
         
-        console.log(`Message deleted from database: ${messageId}`);
+        console.log(`✅ Message deleted from database: ${messageId}`);
         
         // Emit event to all clients to remove the message
         io.emit('messageDeleted', messageId);
-        console.log(`Message deleted event emitted: ${messageId}`);
+        console.log(`📢 Message deleted event emitted: ${messageId}`);
         
       } finally {
         connection.release();
       }
     } catch (error) {
-      console.error('Error deleting message:', error);
+      console.error('❌ Error deleting message:', error);
     }
   });
 
+  // Handle incoming messages - Using queue system
   socket.on('sendMessage', async (message) => {
     const { id, receiverId, driverId, text, media, sender_type } = message;
+    
     const messageWithTimestamp = {
       message_id: id,
       sender_id: socket.id,
@@ -190,85 +332,27 @@ io.on('connection', (socket) => {
       text: text || '',
       timestamp: new Date().toISOString(),
       sender_type: sender_type,
+      media: media,
+      originalMessage: message
     };
 
     // Log sent message
     const senderInfo = users[socket.id];
     const senderName = senderInfo ? senderInfo.name : 'Unknown';
-    console.log(`📤 Message SENT from ${senderName} (${sender_type}):`, text || '[Media message]');
+    console.log(`📤 Message SENT from ${senderName} (${sender_type}):`, text || '[Media message]', `ID: ${id}`);
 
-    let connection;
-    try {
-      connection = await pool.getConnection();
-      
-      // Insert into messages table
-      await connection.query(
-        'INSERT INTO messages (message_id, sender_id, receiver_id, driver_id, text, timestamp, sender_type) VALUES (?, ?, ?, ?, ?, ?, ?)',
-        [
-          messageWithTimestamp.message_id,
-          messageWithTimestamp.sender_id,
-          messageWithTimestamp.receiver_id,
-          messageWithTimestamp.driver_id,
-          messageWithTimestamp.text,
-          messageWithTimestamp.timestamp,
-          messageWithTimestamp.sender_type,
-        ]
-      );
-
-      // If media is present, check if it already exists before inserting
-      if (media && media.length > 0) {
-        for (const item of media) {
-          // Check if this media item already exists for this message
-          const [existingMedia] = await connection.query(
-            'SELECT id FROM media_uploads WHERE message_id = ? AND file_url = ?',
-            [messageWithTimestamp.message_id, item.file_url]
-          );
-
-          // Only insert if it doesn't exist
-          if (existingMedia.length === 0) {
-            await connection.query(
-              'INSERT INTO media_uploads (message_id, driver_id, file_name, file_url, media_type, upload_time, file_size, mime_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-              [
-                messageWithTimestamp.message_id,
-                messageWithTimestamp.driver_id,
-                item.file_name,
-                item.file_url,
-                item.media_type,
-                messageWithTimestamp.timestamp,
-                item.file_size,
-                item.mime_type,
-              ]
-            );
-          }
-        }
-      }
-    } catch (error) {
-      console.error('Error saving message or media:', error);
-    } finally {
-      if (connection) connection.release();
+    // Initialize queue for socket if not exists
+    if (!messageQueue.has(socket.id)) {
+      messageQueue.set(socket.id, []);
     }
 
-    // Message routing logic
-    if (receiverId) {
-      if (users[receiverId]) {
-        io.to(receiverId).emit('receiveMessage', message);
-        const receiverInfo = users[receiverId];
-        console.log(`📨 Message DELIVERED to ${receiverInfo.name} (${receiverInfo.type})`);
-      } else if (receiverId === 'admin') {
-        io.to('admin').emit('receiveMessage', message);
-        console.log(`📨 Message DELIVERED to Admin`);
-      } else if (messageWithTimestamp.driver_id) {
-        const driverSocket = Object.entries(users).find(
-          ([id, user]) => user.driverId === messageWithTimestamp.driver_id && user.type === 'user'
-        );
-        if (driverSocket) {
-          io.to(driverSocket[0]).emit('receiveMessage', message);
-          console.log(`📨 Message DELIVERED to Driver ${messageWithTimestamp.driver_id}`);
-        }
-      }
-    } else {
-      io.emit('receiveMessage', message);
-      console.log(`📨 Message BROADCASTED to all users`);
+    // Add message to queue
+    messageQueue.get(socket.id).push(messageWithTimestamp);
+    console.log(`📥 Added to queue. Socket ${socket.id} queue length: ${messageQueue.get(socket.id).length}`);
+
+    // Start processing if this is the first message in queue
+    if (messageQueue.get(socket.id).length === 1) {
+      processMessageQueue(socket.id);
     }
   });
 
@@ -280,12 +364,19 @@ io.on('connection', (socket) => {
   });
 
   socket.on('disconnect', (reason) => {
-    console.log(`User disconnected: ${socket.id}, reason: ${reason}`);
+    console.log(`🔴 User disconnected: ${socket.id}, reason: ${reason}`);
+    
+    // Clean up message queue for disconnected socket
+    if (messageQueue.has(socket.id)) {
+      messageQueue.delete(socket.id);
+      console.log(`🧹 Cleaned up message queue for disconnected socket: ${socket.id}`);
+    }
+    
     const disconnectedUser = users[socket.id];
     if (disconnectedUser?.type === 'admin') {
       adminOnline = false;
       io.emit('adminStatus', false);
-      console.log('Admin went offline');
+      console.log('👑 Admin went offline');
     }
     delete users[socket.id];
     const onlineUsers = Object.entries(users).map(([id, user]) => ({
@@ -301,7 +392,7 @@ io.on('connection', (socket) => {
 // API endpoint to fetch old messages with associated media
 app.get('/api/messages/:driverId', async (req, res) => {
   try {
-    console.log(`Fetching messages for driver: ${req.params.driverId}`);
+    console.log(`📋 Fetching messages for driver: ${req.params.driverId}`);
     
     const connection = await pool.getConnection();
     try {
@@ -325,7 +416,7 @@ app.get('/api/messages/:driverId', async (req, res) => {
         [req.params.driverId]
       );
 
-      console.log(`Found ${messageRows.length} message records`);
+      console.log(`✅ Found ${messageRows.length} message records for driver: ${req.params.driverId}`);
 
       // Group messages and their media
       const messagesMap = new Map();
@@ -361,14 +452,14 @@ app.get('/api/messages/:driverId', async (req, res) => {
       });
 
       const messages = Array.from(messagesMap.values());
-      console.log(`Returning ${messages.length} grouped messages`);
+      console.log(`📦 Returning ${messages.length} grouped messages for driver: ${req.params.driverId}`);
       
       res.json(messages);
     } finally {
       connection.release();
     }
   } catch (error) {
-    console.error('Error fetching messages:', error);
+    console.error('❌ Error fetching messages:', error);
     res.status(500).json({ 
       success: false,
       error: 'Failed to fetch messages',
@@ -381,7 +472,7 @@ app.get('/api/messages/:driverId', async (req, res) => {
 app.delete('/api/messages/:messageId', async (req, res) => {
   try {
     const { messageId } = req.params;
-    console.log(`API: Deleting message: ${messageId}`);
+    console.log(`🗑️ API: Deleting message: ${messageId}`);
     
     const connection = await pool.getConnection();
     try {
@@ -397,7 +488,7 @@ app.delete('/api/messages/:messageId', async (req, res) => {
         [messageId]
       );
       
-      console.log(`API: Message deleted successfully: ${messageId}`);
+      console.log(`✅ API: Message deleted successfully: ${messageId}`);
       res.json({ 
         success: true, 
         message: 'Message deleted successfully',
@@ -407,7 +498,7 @@ app.delete('/api/messages/:messageId', async (req, res) => {
       connection.release();
     }
   } catch (error) {
-    console.error('API: Error deleting message:', error);
+    console.error('❌ API: Error deleting message:', error);
     res.status(500).json({ 
       success: false,
       error: 'Failed to delete message',
@@ -416,13 +507,32 @@ app.delete('/api/messages/:messageId', async (req, res) => {
   }
 });
 
+// Get queue status endpoint
+app.get('/api/queue-status', (req, res) => {
+  const queueStatus = {};
+  messageQueue.forEach((queue, socketId) => {
+    queueStatus[socketId] = {
+      queueLength: queue.length,
+      user: users[socketId] || 'Unknown'
+    };
+  });
+  
+  res.json({
+    totalQueues: messageQueue.size,
+    queues: queueStatus,
+    totalConnectedUsers: Object.keys(users).length,
+    adminOnline: adminOnline
+  });
+});
+
 // Health check endpoint
 app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'OK', 
     timestamp: new Date().toISOString(),
     adminOnline: adminOnline,
-    connectedUsers: Object.keys(users).length
+    connectedUsers: Object.keys(users).length,
+    messageQueues: messageQueue.size
   });
 });
 
@@ -438,7 +548,7 @@ app.get('/api/test-db', async (req, res) => {
       result: result 
     });
   } catch (error) {
-    console.error('Database test failed:', error);
+    console.error('❌ Database test failed:', error);
     res.status(500).json({ 
       success: false, 
       error: 'Database connection failed',
@@ -472,4 +582,11 @@ httpServer.listen(PORT, () => {
   console.log(`   - GET /api/test-db - Test database connection`);
   console.log(`   - GET /api/messages/:driverId - Get messages for driver`);
   console.log(`   - DELETE /api/messages/:messageId - Delete specific message`);
+  console.log(`   - GET /api/queue-status - Check message queue status`);
+  console.log(`\n📊 Server features:`);
+  console.log(`   ✅ Message queue system for rapid messaging`);
+  console.log(`   ✅ Database connection pooling (20 connections)`);
+  console.log(`   ✅ Transaction support for data consistency`);
+  console.log(`   ✅ Automatic retry on database errors`);
+  console.log(`   ✅ Real-time message delivery tracking`);
 });
