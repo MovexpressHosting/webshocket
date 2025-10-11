@@ -10,43 +10,65 @@ const app = express();
 // Add CORS middleware before routes
 app.use(cors({
   origin: "*",
-  methods: ["GET", "POST", "DELETE"]
+  methods: ["GET", "POST", "DELETE", "PUT", "OPTIONS"]
 }));
 
 // Add JSON parsing middleware
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 const httpServer = createServer(app);
+
+// Enhanced Socket.IO configuration for stability
 const io = new Server(httpServer, {
   cors: {
     origin: "*",
     methods: ["GET", "POST"]
+  },
+  pingTimeout: 60000, // 60 seconds
+  pingInterval: 25000, // 25 seconds
+  connectTimeout: 45000, // 45 seconds
+  transports: ['websocket', 'polling'], // Fallback transport
+  allowUpgrades: true,
+  maxHttpBufferSize: 1e8, // 100MB max message size
+  connectionStateRecovery: {
+    maxDisconnectionDuration: 2 * 60 * 1000, // 2 minutes
+    skipMiddlewares: true
   }
 });
 
-// MySQL Configuration
+// MySQL Configuration with better timeout settings
 const dbConfig = {
   host: "srv657.hstgr.io",
   user: "u442108067_mydb",
   password: "mOhe6ln0iP>",
   database: "u442108067_mydb",
   waitForConnections: true,
-  connectionLimit: 20, // Increased from 10
+  connectionLimit: 25, // Increased for better concurrency
   queueLimit: 0,
-  acquireTimeout: 60000, // 60 seconds
-  timeout: 60000, // 60 seconds
-  reconnect: true
+  acquireTimeout: 60000,
+  timeout: 60000,
+  reconnect: true,
+  enableKeepAlive: true,
+  keepAliveInitialDelay: 0
 };
 
 // Create MySQL connection pool
 const pool = mysql.createPool(dbConfig);
 
-// Track online status and users
+// Track online status and users with connection metadata
 let adminOnline = false;
-const users = {}; // { socketId: { type: 'user'|'admin', name: string, driverId?: string } }
+const users = new Map(); // Use Map for better performance
 
-// Message queue for handling rapid messages
-const messageQueue = new Map(); // { socketId: [] }
+// Message queue for handling rapid messages with enhanced tracking
+const messageQueue = new Map();
+
+// Connection tracker for debugging
+const connectionStats = {
+  totalConnections: 0,
+  totalDisconnections: 0,
+  currentConnections: 0
+};
 
 // Create messages table if not exists
 async function initializeDatabase() {
@@ -55,37 +77,42 @@ async function initializeDatabase() {
     await connection.query(`
       CREATE TABLE IF NOT EXISTS messages (
         id INT AUTO_INCREMENT PRIMARY KEY,
-        message_id VARCHAR(50) NOT NULL,
-        sender_id VARCHAR(50) NOT NULL,
-        receiver_id VARCHAR(50),
-        driver_id VARCHAR(50) NOT NULL,
+        message_id VARCHAR(100) NOT NULL UNIQUE,
+        sender_id VARCHAR(100) NOT NULL,
+        receiver_id VARCHAR(100),
+        driver_id VARCHAR(100) NOT NULL,
         text TEXT NOT NULL,
         timestamp DATETIME NOT NULL,
         sender_type ENUM('user', 'support', 'admin') NOT NULL,
-        INDEX (sender_id),
-        INDEX (receiver_id),
-        INDEX (driver_id),
-        INDEX (timestamp)
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_message_id (message_id),
+        INDEX idx_driver_id (driver_id),
+        INDEX idx_timestamp (timestamp),
+        INDEX idx_sender_driver (sender_id, driver_id)
       )
     `);
+    
     await connection.query(`
       CREATE TABLE IF NOT EXISTS media_uploads (
         id INT AUTO_INCREMENT PRIMARY KEY,
-        message_id VARCHAR(50) NOT NULL,
-        driver_id VARCHAR(50) NOT NULL,
-        file_name VARCHAR(255) NOT NULL,
-        file_url VARCHAR(255) NOT NULL,
+        message_id VARCHAR(100) NOT NULL,
+        driver_id VARCHAR(100) NOT NULL,
+        file_name VARCHAR(500) NOT NULL,
+        file_url VARCHAR(1000) NOT NULL,
         media_type ENUM('image', 'video', 'gif', 'file') NOT NULL,
         upload_time DATETIME NOT NULL,
-        file_size INT,
-        mime_type VARCHAR(100),
-        INDEX (message_id),
-        INDEX (driver_id)
+        file_size BIGINT,
+        mime_type VARCHAR(200),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_message_id (message_id),
+        INDEX idx_driver_id (driver_id),
+        FOREIGN KEY (message_id) REFERENCES messages(message_id) ON DELETE CASCADE
       )
     `);
-    console.log('Database tables initialized successfully');
+    
+    console.log('✅ Database tables initialized successfully');
   } catch (error) {
-    console.error("Database initialization error:", error);
+    console.error("❌ Database initialization error:", error);
   } finally {
     connection.release();
   }
@@ -93,24 +120,24 @@ async function initializeDatabase() {
 
 initializeDatabase();
 
-// Database connection event handlers
+// Enhanced database connection event handlers
 pool.on('connection', (connection) => {
   console.log('🔵 New database connection established');
 });
 
 pool.on('acquire', (connection) => {
-  console.log('🔵 Connection acquired');
+  console.log('🔵 Connection acquired from pool');
 });
 
 pool.on('release', (connection) => {
-  console.log('🔴 Connection released');
+  console.log('🔴 Connection released to pool');
 });
 
 pool.on('error', (err) => {
   console.error('❌ Database pool error:', err);
 });
 
-// Message queue processing function
+// Enhanced message queue processing with connection stability check
 async function processMessageQueue(socketId) {
   if (!messageQueue.has(socketId) || messageQueue.get(socketId).length === 0) {
     return;
@@ -118,6 +145,14 @@ async function processMessageQueue(socketId) {
 
   const queue = messageQueue.get(socketId);
   const messageData = queue[0];
+
+  // Check if socket is still connected
+  const socket = io.sockets.sockets.get(socketId);
+  if (!socket || !socket.connected) {
+    console.log(`⚠️ Socket ${socketId} disconnected, cleaning up queue`);
+    messageQueue.delete(socketId);
+    return;
+  }
 
   console.log(`🔄 Processing message from queue: ${messageData.message_id}, Queue length: ${queue.length}`);
 
@@ -128,9 +163,10 @@ async function processMessageQueue(socketId) {
 
     await connection.beginTransaction();
 
-    // Insert into messages table
+    // Insert into messages table with duplicate check
     const [messageResult] = await connection.query(
-      'INSERT INTO messages (message_id, sender_id, receiver_id, driver_id, text, timestamp, sender_type) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      `INSERT IGNORE INTO messages (message_id, sender_id, receiver_id, driver_id, text, timestamp, sender_type) 
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
       [
         messageData.message_id,
         messageData.sender_id,
@@ -142,13 +178,18 @@ async function processMessageQueue(socketId) {
       ]
     );
 
-    console.log(`✅ Message saved to database: ${messageData.message_id}`);
+    if (messageResult.affectedRows === 0) {
+      console.log(`⚠️ Message already exists, skipping: ${messageData.message_id}`);
+    } else {
+      console.log(`✅ Message saved to database: ${messageData.message_id}`);
+    }
 
     // If media is present, insert media records
     if (messageData.media && messageData.media.length > 0) {
       for (const item of messageData.media) {
         await connection.query(
-          'INSERT INTO media_uploads (message_id, driver_id, file_name, file_url, media_type, upload_time, file_size, mime_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+          `INSERT IGNORE INTO media_uploads (message_id, driver_id, file_name, file_url, media_type, upload_time, file_size, mime_type) 
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             messageData.message_id,
             messageData.driver_id,
@@ -168,35 +209,40 @@ async function processMessageQueue(socketId) {
     await connection.commit();
     console.log(`✅ Transaction committed for message: ${messageData.message_id}`);
 
-    // Remove from queue and emit to clients
+    // Remove from queue
     queue.shift();
     
-    // Emit the original message to clients
-    const receiverId = messageData.receiver_id;
-    const driverId = messageData.driver_id;
-    const originalMessage = messageData.originalMessage;
+    // Emit the original message to clients only if socket is still connected
+    if (socket.connected) {
+      const receiverId = messageData.receiver_id;
+      const driverId = messageData.driver_id;
+      const originalMessage = messageData.originalMessage;
 
-    // Message routing logic
-    if (receiverId) {
-      if (users[receiverId]) {
-        io.to(receiverId).emit('receiveMessage', originalMessage);
-        const receiverInfo = users[receiverId];
-        console.log(`📨 Message DELIVERED to ${receiverInfo.name} (${receiverInfo.type})`);
-      } else if (receiverId === 'admin') {
-        io.to('admin').emit('receiveMessage', originalMessage);
-        console.log(`📨 Message DELIVERED to Admin`);
-      } else if (driverId) {
-        const driverSocket = Object.entries(users).find(
-          ([id, user]) => user.driverId === driverId && user.type === 'user'
-        );
-        if (driverSocket) {
-          io.to(driverSocket[0]).emit('receiveMessage', originalMessage);
-          console.log(`📨 Message DELIVERED to Driver ${driverId}`);
+      // Enhanced message routing logic
+      if (receiverId) {
+        if (users.has(receiverId)) {
+          socket.to(receiverId).emit('receiveMessage', originalMessage);
+          const receiverInfo = users.get(receiverId);
+          console.log(`📨 Message DELIVERED to ${receiverInfo.name} (${receiverInfo.type})`);
+        } else if (receiverId === 'admin') {
+          io.to('admin').emit('receiveMessage', originalMessage);
+          console.log(`📨 Message DELIVERED to Admin`);
+        } else if (driverId) {
+          // Find all sockets for this driver
+          for (let [sockId, user] of users) {
+            if (user.driverId === driverId && user.type === 'user') {
+              socket.to(sockId).emit('receiveMessage', originalMessage);
+              console.log(`📨 Message DELIVERED to Driver ${driverId}`);
+            }
+          }
         }
+      } else {
+        // Broadcast to relevant parties
+        io.emit('receiveMessage', originalMessage);
+        console.log(`📨 Message BROADCASTED to all users`);
       }
     } else {
-      io.emit('receiveMessage', originalMessage);
-      console.log(`📨 Message BROADCASTED to all users`);
+      console.log(`⚠️ Socket disconnected, message not delivered: ${messageData.message_id}`);
     }
 
   } catch (error) {
@@ -207,9 +253,17 @@ async function processMessageQueue(socketId) {
       await connection.rollback();
     }
     
-    // Retry the same message after a delay
-    console.log(`🔄 Retrying message: ${messageData.message_id} after 500ms`);
-    setTimeout(() => processMessageQueue(socketId), 500);
+    // Enhanced retry logic with exponential backoff
+    const retryCount = messageData.retryCount || 0;
+    if (retryCount < 3) {
+      messageData.retryCount = retryCount + 1;
+      const delay = Math.min(1000 * Math.pow(2, retryCount), 10000); // Exponential backoff max 10s
+      console.log(`🔄 Retrying message (attempt ${retryCount + 1}): ${messageData.message_id} after ${delay}ms`);
+      setTimeout(() => processMessageQueue(socketId), delay);
+    } else {
+      console.error(`❌ Max retries exceeded for message: ${messageData.message_id}`);
+      queue.shift(); // Remove failed message after max retries
+    }
     return;
   } finally {
     // Always release the connection back to the pool
@@ -221,73 +275,95 @@ async function processMessageQueue(socketId) {
 
   // Process next message in queue after a small delay
   if (queue.length > 0) {
-    setTimeout(() => processMessageQueue(socketId), 50);
+    setTimeout(() => processMessageQueue(socketId), 30); // Reduced delay for better throughput
   } else {
     console.log(`✅ Message queue empty for socket: ${socketId}`);
   }
 }
 
-// Socket.io connection handling
+// Enhanced Socket.io connection handling with stability features
 io.on('connection', (socket) => {
-  console.log(`🔗 User connected: ${socket.id}`);
+  connectionStats.totalConnections++;
+  connectionStats.currentConnections++;
+  
+  console.log(`🔗 User connected: ${socket.id} | Active: ${connectionStats.currentConnections} | Total: ${connectionStats.totalConnections}`);
+
+  // Add connection metadata
+  socket.connectionTime = new Date();
+  socket.connectionId = socket.id;
 
   socket.on('register', (userType, userName, driverId) => {
-    users[socket.id] = {
+    users.set(socket.id, {
       type: userType,
       name: userName || `User-${socket.id.slice(0, 4)}`,
       driverId,
-    };
+      connectedAt: new Date(),
+      socketId: socket.id
+    });
+    
     socket.join(userType);
+    
     if (userType === 'admin') {
       adminOnline = true;
       io.emit('adminStatus', true);
       console.log('👑 Admin registered and online');
     }
-    const onlineUsers = Object.entries(users).map(([id, user]) => ({
+    
+    // Broadcast online users
+    const onlineUsers = Array.from(users.entries()).map(([id, user]) => ({
       id,
       name: user.name,
       type: user.type,
       driverId: user.driverId,
+      connectedAt: user.connectedAt
     }));
+    
     io.emit('onlineUsers', onlineUsers);
-    console.log(`✅ User registered: ${userName} (${userType})`);
+    console.log(`✅ User registered: ${userName} (${userType}) | Total online: ${users.size}`);
   });
 
-  // New event to get driver's socket ID
+  // Enhanced getDriverSocketId with better error handling
   socket.on('getDriverSocketId', (driverId, callback) => {
-    const driverSocket = Object.entries(users).find(
-      ([id, user]) => user.driverId === driverId && user.type === 'user'
-    );
-    if (driverSocket) {
-      callback(driverSocket[0]); // Return the socket ID
-    } else {
-      callback(null); // Driver not found or offline
+    try {
+      for (let [sockId, user] of users) {
+        if (user.driverId === driverId && user.type === 'user' && io.sockets.sockets.get(sockId)?.connected) {
+          callback(sockId);
+          return;
+        }
+      }
+      callback(null);
+    } catch (error) {
+      console.error('Error in getDriverSocketId:', error);
+      callback(null);
     }
   });
 
   // Handle manual driver disconnection
   socket.on('disconnectUser', (driverId) => {
-    const driverSockets = Object.entries(users).filter(
-      ([id, user]) => user.driverId === driverId && user.type === 'user'
-    );
-    driverSockets.forEach(([socketId, user]) => {
-      delete users[socketId];
-      const driverSocket = io.sockets.sockets.get(socketId);
-      if (driverSocket) {
-        driverSocket.disconnect(true);
+    let disconnectedCount = 0;
+    for (let [sockId, user] of users) {
+      if (user.driverId === driverId && user.type === 'user') {
+        users.delete(sockId);
+        const driverSocket = io.sockets.sockets.get(sockId);
+        if (driverSocket) {
+          driverSocket.disconnect(true);
+          disconnectedCount++;
+        }
       }
-    });
-    const onlineUsers = Object.entries(users).map(([id, user]) => ({
+    }
+    
+    const onlineUsers = Array.from(users.entries()).map(([id, user]) => ({
       id,
       name: user.name,
       type: user.type,
       driverId: user.driverId,
     }));
+    
     io.emit('onlineUsers', onlineUsers);
-    console.log(`🔴 User manually disconnected: ${driverId}`);
+    console.log(`🔴 ${disconnectedCount} user(s) manually disconnected: ${driverId}`);
   });
 
-  // Handle message deletion
+  // Handle message deletion with enhanced error handling
   socket.on('deleteMessage', async (messageId, driverId) => {
     try {
       console.log(`🗑️ Deleting message: ${messageId} for driver: ${driverId}`);
@@ -300,13 +376,7 @@ io.on('connection', (socket) => {
           [messageId, driverId]
         );
         
-        // Delete associated media
-        await connection.query(
-          'DELETE FROM media_uploads WHERE message_id = ?',
-          [messageId]
-        );
-        
-        console.log(`✅ Message deleted from database: ${messageId}`);
+        console.log(`✅ Message deleted from database: ${messageId}, affected rows: ${messageResult.affectedRows}`);
         
         // Emit event to all clients to remove the message
         io.emit('messageDeleted', messageId);
@@ -317,11 +387,18 @@ io.on('connection', (socket) => {
       }
     } catch (error) {
       console.error('❌ Error deleting message:', error);
+      socket.emit('error', { type: 'DELETE_MESSAGE_ERROR', message: error.message });
     }
   });
 
-  // Handle incoming messages - Using queue system
+  // Enhanced message handling with connection validation
   socket.on('sendMessage', async (message) => {
+    // Validate socket connection
+    if (!socket.connected) {
+      console.log(`⚠️ Socket not connected, ignoring message from: ${socket.id}`);
+      return;
+    }
+
     const { id, receiverId, driverId, text, media, sender_type } = message;
     
     const messageWithTimestamp = {
@@ -333,13 +410,14 @@ io.on('connection', (socket) => {
       timestamp: new Date().toISOString(),
       sender_type: sender_type,
       media: media,
-      originalMessage: message
+      originalMessage: message,
+      queuedAt: new Date()
     };
 
     // Log sent message
-    const senderInfo = users[socket.id];
+    const senderInfo = users.get(socket.id);
     const senderName = senderInfo ? senderInfo.name : 'Unknown';
-    console.log(`📤 Message SENT from ${senderName} (${sender_type}):`, text || '[Media message]', `ID: ${id}`);
+    console.log(`📤 Message SENT from ${senderName} (${sender_type}):`, text?.substring(0, 50) || '[Media message]', `ID: ${id}`);
 
     // Initialize queue for socket if not exists
     if (!messageQueue.has(socket.id)) {
@@ -358,48 +436,73 @@ io.on('connection', (socket) => {
 
   // Listen for received messages
   socket.on('receiveMessage', (message) => {
-    const receiverInfo = users[socket.id];
+    const receiverInfo = users.get(socket.id);
     const receiverName = receiverInfo ? receiverInfo.name : 'Unknown';
-    console.log(`📥 Message RECEIVED by ${receiverName}:`, message.text || '[Media message]');
+    console.log(`📥 Message RECEIVED by ${receiverName}:`, message.text?.substring(0, 50) || '[Media message]');
   });
 
+  // Enhanced disconnect handler with better cleanup
   socket.on('disconnect', (reason) => {
-    console.log(`🔴 User disconnected: ${socket.id}, reason: ${reason}`);
+    connectionStats.totalDisconnections++;
+    connectionStats.currentConnections--;
+    
+    console.log(`🔴 User disconnected: ${socket.id}, reason: ${reason} | Active: ${connectionStats.currentConnections}`);
+    
+    // Enhanced cleanup with connection duration
+    const userInfo = users.get(socket.id);
+    const connectionDuration = userInfo ? 
+      Math.round((new Date() - userInfo.connectedAt) / 1000) : 0;
     
     // Clean up message queue for disconnected socket
     if (messageQueue.has(socket.id)) {
+      const pendingMessages = messageQueue.get(socket.id).length;
       messageQueue.delete(socket.id);
-      console.log(`🧹 Cleaned up message queue for disconnected socket: ${socket.id}`);
+      console.log(`🧹 Cleaned up message queue for disconnected socket: ${socket.id} (${pendingMessages} pending messages)`);
     }
     
-    const disconnectedUser = users[socket.id];
-    if (disconnectedUser?.type === 'admin') {
+    // Update admin status if admin disconnected
+    if (userInfo?.type === 'admin') {
       adminOnline = false;
       io.emit('adminStatus', false);
-      console.log('👑 Admin went offline');
+      console.log(`👑 Admin went offline (connected for ${connectionDuration}s)`);
     }
-    delete users[socket.id];
-    const onlineUsers = Object.entries(users).map(([id, user]) => ({
+    
+    users.delete(socket.id);
+    
+    // Broadcast updated online users
+    const onlineUsers = Array.from(users.entries()).map(([id, user]) => ({
       id,
       name: user.name,
       type: user.type,
       driverId: user.driverId,
     }));
+    
     io.emit('onlineUsers', onlineUsers);
+  });
+
+  // Heartbeat mechanism for connection health
+  socket.on('heartbeat', () => {
+    socket.emit('heartbeat_ack');
+  });
+
+  // Error handling
+  socket.on('error', (error) => {
+    console.error(`❌ Socket error for ${socket.id}:`, error);
   });
 });
 
-// API endpoint to fetch old messages with associated media
+// Enhanced API endpoint to fetch old messages with better error handling
 app.get('/api/messages/:driverId', async (req, res) => {
   try {
-    console.log(`📋 Fetching messages for driver: ${req.params.driverId}`);
+    const driverId = req.params.driverId;
+    console.log(`📋 Fetching messages for driver: ${driverId}`);
     
     const connection = await pool.getConnection();
     try {
       const [messageRows] = await connection.query(
         `SELECT m.*,
          CASE
-           WHEN m.sender_id = 'admin' THEN 'support'
+           WHEN m.sender_type = 'admin' OR m.sender_type = 'support' THEN 'support'
            ELSE 'user'
          END as sender,
          m.sender_type,
@@ -413,10 +516,10 @@ app.get('/api/messages/:driverId', async (req, res) => {
          LEFT JOIN media_uploads mu ON m.message_id = mu.message_id
          WHERE m.driver_id = ?
          ORDER BY m.timestamp ASC`,
-        [req.params.driverId]
+        [driverId]
       );
 
-      console.log(`✅ Found ${messageRows.length} message records for driver: ${req.params.driverId}`);
+      console.log(`✅ Found ${messageRows.length} message records for driver: ${driverId}`);
 
       // Group messages and their media
       const messagesMap = new Map();
@@ -430,7 +533,7 @@ app.get('/api/messages/:driverId', async (req, res) => {
             sender: row.sender,
             timestamp: row.timestamp,
             senderId: row.sender_id,
-            senderName: row.sender_type === 'support' ? 'Support' : 'User',
+            senderName: row.sender_type === 'support' || row.sender_type === 'admin' ? 'Support' : 'User',
             receiverId: row.receiver_id,
             driverId: row.driver_id,
             media: []
@@ -452,7 +555,7 @@ app.get('/api/messages/:driverId', async (req, res) => {
       });
 
       const messages = Array.from(messagesMap.values());
-      console.log(`📦 Returning ${messages.length} grouped messages for driver: ${req.params.driverId}`);
+      console.log(`📦 Returning ${messages.length} grouped messages for driver: ${driverId}`);
       
       res.json(messages);
     } finally {
@@ -482,17 +585,12 @@ app.delete('/api/messages/:messageId', async (req, res) => {
         [messageId]
       );
       
-      // Delete associated media
-      await connection.query(
-        'DELETE FROM media_uploads WHERE message_id = ?',
-        [messageId]
-      );
-      
-      console.log(`✅ API: Message deleted successfully: ${messageId}`);
+      console.log(`✅ API: Message deleted successfully: ${messageId}, affected rows: ${messageResult.affectedRows}`);
       res.json({ 
         success: true, 
         message: 'Message deleted successfully',
-        deletedId: messageId 
+        deletedId: messageId,
+        affectedRows: messageResult.affectedRows
       });
     } finally {
       connection.release();
@@ -507,32 +605,49 @@ app.delete('/api/messages/:messageId', async (req, res) => {
   }
 });
 
-// Get queue status endpoint
+// Enhanced queue status endpoint
 app.get('/api/queue-status', (req, res) => {
   const queueStatus = {};
+  let totalPending = 0;
+  
   messageQueue.forEach((queue, socketId) => {
+    const user = users.get(socketId);
     queueStatus[socketId] = {
       queueLength: queue.length,
-      user: users[socketId] || 'Unknown'
+      user: user || 'Unknown',
+      pendingMessages: queue.map(m => ({
+        id: m.message_id,
+        text: m.text?.substring(0, 50) || '[Media]',
+        queuedAt: m.queuedAt
+      }))
     };
+    totalPending += queue.length;
   });
   
   res.json({
     totalQueues: messageQueue.size,
+    totalPendingMessages: totalPending,
     queues: queueStatus,
-    totalConnectedUsers: Object.keys(users).length,
-    adminOnline: adminOnline
+    connectionStats: {
+      ...connectionStats,
+      onlineUsers: users.size
+    },
+    adminOnline: adminOnline,
+    serverTime: new Date().toISOString()
   });
 });
 
-// Health check endpoint
+// Enhanced health check endpoint
 app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'OK', 
     timestamp: new Date().toISOString(),
     adminOnline: adminOnline,
-    connectedUsers: Object.keys(users).length,
-    messageQueues: messageQueue.size
+    connectedUsers: users.size,
+    messageQueues: messageQueue.size,
+    connectionStats: connectionStats,
+    uptime: process.uptime(),
+    memory: process.memoryUsage()
   });
 });
 
@@ -540,12 +655,13 @@ app.get('/api/health', (req, res) => {
 app.get('/api/test-db', async (req, res) => {
   try {
     const connection = await pool.getConnection();
-    const [result] = await connection.query('SELECT 1 as test');
+    const [result] = await connection.query('SELECT 1 as test, NOW() as time');
     connection.release();
     res.json({ 
       success: true, 
       message: 'Database connection successful',
-      result: result 
+      result: result,
+      serverTime: new Date().toISOString()
     });
   } catch (error) {
     console.error('❌ Database test failed:', error);
@@ -555,6 +671,18 @@ app.get('/api/test-db', async (req, res) => {
       details: error.message 
     });
   }
+});
+
+// Server info endpoint
+app.get('/api/server-info', (req, res) => {
+  res.json({
+    nodeVersion: process.version,
+    platform: process.platform,
+    arch: process.arch,
+    uptime: process.uptime(),
+    memory: process.memoryUsage(),
+    env: process.env.NODE_ENV || 'development'
+  });
 });
 
 function getLocalIpAddress() {
@@ -574,19 +702,54 @@ function getLocalIpAddress() {
 const PORT = process.env.PORT || 3000;
 httpServer.listen(PORT, () => {
   const localIp = getLocalIpAddress();
-  console.log(`🚀 Socket.IO server running at:`);
+  console.log(`\n🚀 Enhanced Socket.IO Server Started!`);
+  console.log(`   ======================================`);
   console.log(`   Local:   http://localhost:${PORT}`);
   console.log(`   Network: http://${localIp}:${PORT}`);
-  console.log(`   API endpoints:`);
-  console.log(`   - GET /api/health - Health check`);
-  console.log(`   - GET /api/test-db - Test database connection`);
-  console.log(`   - GET /api/messages/:driverId - Get messages for driver`);
-  console.log(`   - DELETE /api/messages/:messageId - Delete specific message`);
-  console.log(`   - GET /api/queue-status - Check message queue status`);
-  console.log(`\n📊 Server features:`);
-  console.log(`   ✅ Message queue system for rapid messaging`);
-  console.log(`   ✅ Database connection pooling (20 connections)`);
-  console.log(`   ✅ Transaction support for data consistency`);
-  console.log(`   ✅ Automatic retry on database errors`);
-  console.log(`   ✅ Real-time message delivery tracking`);
+  console.log(`   ======================================`);
+  console.log(`   📊 Enhanced Features:`);
+  console.log(`   ✅ Message queue with connection validation`);
+  console.log(`   ✅ Exponential backoff retry mechanism`);
+  console.log(`   ✅ Connection stability improvements`);
+  console.log(`   ✅ Enhanced error handling and logging`);
+  console.log(`   ✅ Database connection pooling (25 connections)`);
+  console.log(`   ✅ Connection recovery support`);
+  console.log(`   ======================================`);
+  console.log(`   🔧 API Endpoints:`);
+  console.log(`   - GET  /api/health - Health check`);
+  console.log(`   - GET  /api/test-db - Test database`);
+  console.log(`   - GET  /api/messages/:driverId - Get messages`);
+  console.log(`   - DEL  /api/messages/:messageId - Delete message`);
+  console.log(`   - GET  /api/queue-status - Queue monitoring`);
+  console.log(`   - GET  /api/server-info - Server information`);
+  console.log(`   ======================================\n`);
+});
+
+// Graceful shutdown handling
+process.on('SIGTERM', async () => {
+  console.log('🔄 SIGTERM received, shutting down gracefully...');
+  
+  // Close Socket.IO
+  io.close(() => {
+    console.log('✅ Socket.IO closed');
+  });
+  
+  // Close database pool
+  await pool.end();
+  console.log('✅ Database pool closed');
+  
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('🔄 SIGINT received, shutting down gracefully...');
+  
+  io.close(() => {
+    console.log('✅ Socket.IO closed');
+  });
+  
+  await pool.end();
+  console.log('✅ Database pool closed');
+  
+  process.exit(0);
 });
