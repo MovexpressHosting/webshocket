@@ -7,7 +7,7 @@ const mysql = require('mysql2/promise');
 
 const app = express();
 
-// 
+// Add CORS middleware before routes
 app.use(cors({
   origin: "*",
   methods: ["GET", "POST", "DELETE"]
@@ -37,10 +37,6 @@ const dbConfig = {
 
 // Create MySQL connection pool
 const pool = mysql.createPool(dbConfig);
-
-// Track online status and users
-let adminOnline = false;
-const users = {}; // { socketId: { type: 'user'|'admin', name: string, driverId?: string } }
 
 // Track online status and users
 let adminOnline = false;
