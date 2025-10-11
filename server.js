@@ -7,7 +7,7 @@ const mysql = require('mysql2/promise');
 
 const app = express();
 
-// Add CORS middleware before routes
+// 
 app.use(cors({
   origin: "*",
   methods: ["GET", "POST", "DELETE"]
