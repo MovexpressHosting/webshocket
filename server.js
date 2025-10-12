@@ -180,95 +180,126 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('sendMessage', async (message) => {
-    const { id, receiverId, driverId, text, media, sender_type } = message;
-    const messageWithTimestamp = {
-      message_id: id,
-      sender_id: socket.id,
-      receiver_id: receiverId,
-      driver_id: driverId,
-      text: text || '',
-      timestamp: new Date().toISOString(),
-      sender_type: sender_type,
-    };
-
-    // Log sent message
-    const senderInfo = users[socket.id];
-    const senderName = senderInfo ? senderInfo.name : 'Unknown';
-    console.log(`📤 Message SENT from ${senderName} (${sender_type}):`, text || '[Media message]');
-
-    let connection;
+  socket.on('sendMessage', async (message, callback) => {
     try {
-      connection = await pool.getConnection();
+      console.log('📨 Received message from client:', message);
       
-      // Insert into messages table
-      await connection.query(
-        'INSERT INTO messages (message_id, sender_id, receiver_id, driver_id, text, timestamp, sender_type) VALUES (?, ?, ?, ?, ?, ?, ?)',
-        [
-          messageWithTimestamp.message_id,
-          messageWithTimestamp.sender_id,
-          messageWithTimestamp.receiver_id,
-          messageWithTimestamp.driver_id,
-          messageWithTimestamp.text,
-          messageWithTimestamp.timestamp,
-          messageWithTimestamp.sender_type,
-        ]
-      );
+      const { id, receiverId, driverId, text, media, sender_type } = message;
+      
+      if (!driverId) {
+        console.error('Missing driverId in message');
+        if (callback) callback({ success: false, error: 'Missing driverId' });
+        return;
+      }
 
-      // If media is present, check if it already exists before inserting
-      if (media && media.length > 0) {
-        for (const item of media) {
-          // Check if this media item already exists for this message
-          const [existingMedia] = await connection.query(
-            'SELECT id FROM media_uploads WHERE message_id = ? AND file_url = ?',
-            [messageWithTimestamp.message_id, item.file_url]
-          );
+      const messageWithTimestamp = {
+        message_id: id,
+        sender_id: socket.id,
+        receiver_id: receiverId,
+        driver_id: driverId,
+        text: text || '',
+        timestamp: new Date().toISOString(),
+        sender_type: sender_type,
+      };
 
-          // Only insert if it doesn't exist
-          if (existingMedia.length === 0) {
-            await connection.query(
-              'INSERT INTO media_uploads (message_id, driver_id, file_name, file_url, media_type, upload_time, file_size, mime_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-              [
-                messageWithTimestamp.message_id,
-                messageWithTimestamp.driver_id,
-                item.file_name,
-                item.file_url,
-                item.media_type,
-                messageWithTimestamp.timestamp,
-                item.file_size,
-                item.mime_type,
-              ]
+      // Log sent message
+      const senderInfo = users[socket.id];
+      const senderName = senderInfo ? senderInfo.name : 'Unknown';
+      console.log(`📤 Message from ${senderName} (${sender_type}) to driver ${driverId}:`, text || '[Media message]');
+
+      let connection;
+      try {
+        connection = await pool.getConnection();
+        
+        // Insert into messages table
+        await connection.query(
+          'INSERT INTO messages (message_id, sender_id, receiver_id, driver_id, text, timestamp, sender_type) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          [
+            messageWithTimestamp.message_id,
+            messageWithTimestamp.sender_id,
+            messageWithTimestamp.receiver_id,
+            messageWithTimestamp.driver_id,
+            messageWithTimestamp.text,
+            messageWithTimestamp.timestamp,
+            messageWithTimestamp.sender_type,
+          ]
+        );
+
+        // If media is present, insert into media_uploads table
+        if (media && media.length > 0) {
+          for (const item of media) {
+            // Check if this media item already exists for this message
+            const [existingMedia] = await connection.query(
+              'SELECT id FROM media_uploads WHERE message_id = ? AND file_url = ?',
+              [messageWithTimestamp.message_id, item.file_url]
             );
+
+            // Only insert if it doesn't exist
+            if (existingMedia.length === 0) {
+              await connection.query(
+                'INSERT INTO media_uploads (message_id, driver_id, file_name, file_url, media_type, upload_time, file_size, mime_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                [
+                  messageWithTimestamp.message_id,
+                  messageWithTimestamp.driver_id,
+                  item.file_name,
+                  item.file_url,
+                  item.media_type,
+                  messageWithTimestamp.timestamp,
+                  item.file_size,
+                  item.mime_type,
+                ]
+              );
+            }
           }
         }
-      }
-    } catch (error) {
-      console.error('Error saving message or media:', error);
-    } finally {
-      if (connection) connection.release();
-    }
 
-    // Message routing logic
-    if (receiverId) {
-      if (users[receiverId]) {
-        io.to(receiverId).emit('receiveMessage', message);
-        const receiverInfo = users[receiverId];
-        console.log(`📨 Message DELIVERED to ${receiverInfo.name} (${receiverInfo.type})`);
-      } else if (receiverId === 'admin') {
-        io.to('admin').emit('receiveMessage', message);
-        console.log(`📨 Message DELIVERED to Admin`);
-      } else if (messageWithTimestamp.driver_id) {
+        console.log('✅ Message saved to database');
+
+        // Send acknowledgement back to sender IMMEDIATELY after saving to database
+        if (callback) {
+          callback({ 
+            success: true, 
+            message: 'Message sent successfully',
+            messageId: id 
+          });
+        }
+
+      } catch (dbError) {
+        console.error('❌ Database error:', dbError);
+        if (callback) {
+          callback({ success: false, error: 'Database error: ' + dbError.message });
+        }
+        return;
+      } finally {
+        if (connection) connection.release();
+      }
+
+      // Message routing logic (this happens after acknowledgement)
+      let messageDelivered = false;
+      
+      if (messageWithTimestamp.driver_id) {
         const driverSocket = Object.entries(users).find(
           ([id, user]) => user.driverId === messageWithTimestamp.driver_id && user.type === 'user'
         );
         if (driverSocket) {
           io.to(driverSocket[0]).emit('receiveMessage', message);
-          console.log(`📨 Message DELIVERED to Driver ${messageWithTimestamp.driver_id}`);
+          console.log(`📨 Message delivered to driver ${messageWithTimestamp.driver_id}`);
+          messageDelivered = true;
+        } else {
+          console.log(`❌ Driver ${messageWithTimestamp.driver_id} not found online`);
         }
       }
-    } else {
-      io.emit('receiveMessage', message);
-      console.log(`📨 Message BROADCASTED to all users`);
+
+      // Log delivery status
+      if (!messageDelivered) {
+        console.log(`💾 Message saved but driver offline: ${messageWithTimestamp.driver_id}`);
+      }
+
+    } catch (error) {
+      console.error('❌ Error in sendMessage handler:', error);
+      if (callback) {
+        callback({ success: false, error: 'Server error: ' + error.message });
+      }
     }
   });
 
