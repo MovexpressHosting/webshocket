@@ -31,8 +31,8 @@ const dbConfig = {
   password: "mOhe6ln0iP>",
   database: "u442108067_mydb",
   waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0
+  connectionLimit: 50,
+  queueLimit: 10
 };
 
 // Create MySQL connection pool
@@ -639,5 +639,6 @@ httpServer.listen(PORT, () => {
   console.log(`   - GET /api/messages/:driverId - Get messages for driver`);
   console.log(`   - DELETE /api/messages/:messageId - Delete specific message`);
 });
+
 
 
