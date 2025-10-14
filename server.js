@@ -120,6 +120,25 @@ function getOnlineUsersList() {
   return onlineUsers;
 }
 
+// Helper function to get all connected drivers (regardless of chat status)
+function getAllConnectedDrivers() {
+  const connectedDrivers = [];
+  
+  Object.entries(users).forEach(([socketId, user]) => {
+    if (user.type === 'user' && user.driverId) {
+      connectedDrivers.push({
+        id: socketId,
+        driverId: user.driverId,
+        name: user.name,
+        isInChat: user.isInChat,
+        isConnected: true
+      });
+    }
+  });
+  
+  return connectedDrivers;
+}
+
 // Helper function to emit online users to all clients
 function emitOnlineUsers() {
   const onlineUsers = getOnlineUsersList();
@@ -127,11 +146,22 @@ function emitOnlineUsers() {
   console.log('Online users updated:', onlineUsers);
 }
 
+// Helper function to emit connected drivers to admin
+function emitConnectedDrivers() {
+  const connectedDrivers = getAllConnectedDrivers();
+  Object.keys(adminUsers).forEach(adminSocketId => {
+    io.to(adminSocketId).emit('connectedDrivers', connectedDrivers);
+  });
+  console.log('Connected drivers updated:', connectedDrivers);
+}
+
 // Add message deletion event handler
 io.on('connection', (socket) => {
   console.log(`User connected: ${socket.id}`);
 
-  socket.on('register', (userType, userName, driverId) => {
+  socket.on('register', (userData) => {
+    const { userType, userName, driverId } = userData;
+    
     users[socket.id] = {
       type: userType,
       name: userName || `User-${socket.id.slice(0, 4)}`,
@@ -144,10 +174,39 @@ io.on('connection', (socket) => {
     if (userType === 'admin') {
       adminUsers[socket.id] = true;
       console.log('Admin registered and online');
+      
+      // Send current connected drivers to this admin
+      const connectedDrivers = getAllConnectedDrivers();
+      socket.emit('connectedDrivers', connectedDrivers);
     }
     
     emitOnlineUsers();
+    emitConnectedDrivers();
     console.log(`User registered: ${userName} (${userType})`);
+  });
+
+  // Handle admin online status
+  socket.on('adminOnline', () => {
+    // If admin is not already registered, register them
+    if (!users[socket.id]) {
+      users[socket.id] = {
+        type: 'admin',
+        name: 'Admin',
+        driverId: null,
+        isInChat: true
+      };
+      adminUsers[socket.id] = true;
+      console.log('Admin marked as online');
+    }
+    
+    socket.join('admin');
+    
+    // Send current connected drivers to this admin
+    const connectedDrivers = getAllConnectedDrivers();
+    socket.emit('connectedDrivers', connectedDrivers);
+    
+    emitOnlineUsers();
+    emitConnectedDrivers();
   });
 
   // Driver enters chat - update their status
@@ -156,6 +215,7 @@ io.on('connection', (socket) => {
       users[socket.id].isInChat = true;
       console.log(`Driver ${driverId} entered chat`);
       emitOnlineUsers();
+      emitConnectedDrivers();
     }
   });
 
@@ -165,6 +225,7 @@ io.on('connection', (socket) => {
       users[socket.id].isInChat = false;
       console.log(`Driver ${driverId} left chat`);
       emitOnlineUsers();
+      emitConnectedDrivers();
     }
   });
 
@@ -193,6 +254,7 @@ io.on('connection', (socket) => {
       }
     });
     emitOnlineUsers();
+    emitConnectedDrivers();
     console.log(`User manually disconnected: ${driverId}`);
   });
 
@@ -344,6 +406,7 @@ io.on('connection', (socket) => {
     }
     
     emitOnlineUsers();
+    emitConnectedDrivers();
   });
 });
 
@@ -471,7 +534,8 @@ app.get('/api/health', (req, res) => {
     status: 'OK', 
     timestamp: new Date().toISOString(),
     adminOnline: isAdminOnline(),
-    connectedUsers: Object.keys(users).length
+    connectedUsers: Object.keys(users).length,
+    connectedDrivers: getAllConnectedDrivers().length
   });
 });
 
