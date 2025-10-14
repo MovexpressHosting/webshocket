@@ -347,6 +347,123 @@ io.on('connection', (socket) => {
   });
 });
 
+
+
+
+// API endpoint to get all connected drivers
+app.get('/api/connected-drivers', (req, res) => {
+  try {
+    const connectedDrivers = [];
+    
+    // Iterate through all users and filter for connected drivers
+    Object.entries(users).forEach(([socketId, user]) => {
+      if (user.type === 'user' && user.isInChat) {
+        connectedDrivers.push({
+          socketId: socketId,
+          driverId: user.driverId,
+          name: user.name,
+          isInChat: user.isInChat,
+          connectionTime: new Date().toISOString() // You might want to track this separately
+        });
+      }
+    });
+
+    console.log(`Found ${connectedDrivers.length} connected drivers`);
+    
+    res.json({
+      success: true,
+      count: connectedDrivers.length,
+      drivers: connectedDrivers
+    });
+  } catch (error) {
+    console.error('Error fetching connected drivers:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch connected drivers',
+      details: error.message
+    });
+  }
+});
+
+// API endpoint to get all drivers (including those not in chat)
+app.get('/api/all-drivers', (req, res) => {
+  try {
+    const allDrivers = [];
+    
+    Object.entries(users).forEach(([socketId, user]) => {
+      if (user.type === 'user') {
+        allDrivers.push({
+          socketId: socketId,
+          driverId: user.driverId,
+          name: user.name,
+          isInChat: user.isInChat,
+          isOnline: true, // Since they're in the users object, they're connected
+          connectionTime: new Date().toISOString()
+        });
+      }
+    });
+
+    console.log(`Found ${allDrivers.length} total driver connections`);
+    
+    res.json({
+      success: true,
+      count: allDrivers.length,
+      drivers: allDrivers
+    });
+  } catch (error) {
+    console.error('Error fetching all drivers:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch drivers',
+      details: error.message
+    });
+  }
+});
+
+// API endpoint to get driver connection status
+app.get('/api/driver-status/:driverId', (req, res) => {
+  try {
+    const { driverId } = req.params;
+    
+    const driverConnections = Object.entries(users).filter(
+      ([socketId, user]) => user.driverId === driverId && user.type === 'user'
+    );
+
+    const status = {
+      driverId: driverId,
+      isOnline: driverConnections.length > 0,
+      connections: driverConnections.map(([socketId, user]) => ({
+        socketId: socketId,
+        name: user.name,
+        isInChat: user.isInChat,
+        connectionTime: new Date().toISOString()
+      })),
+      totalConnections: driverConnections.length
+    };
+
+    console.log(`Status for driver ${driverId}:`, status);
+    
+    res.json({
+      success: true,
+      status: status
+    });
+  } catch (error) {
+    console.error('Error fetching driver status:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch driver status',
+      details: error.message
+    });
+  }
+});
+
+
+
+
+
+
+
+
 // API endpoint to fetch old messages with associated media
 app.get('/api/messages/:driverId', async (req, res) => {
   try {
@@ -522,4 +639,5 @@ httpServer.listen(PORT, () => {
   console.log(`   - GET /api/messages/:driverId - Get messages for driver`);
   console.log(`   - DELETE /api/messages/:messageId - Delete specific message`);
 });
+
 
