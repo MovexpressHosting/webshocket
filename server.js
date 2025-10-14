@@ -7,7 +7,7 @@ const mysql = require('mysql2/promise');
 
 const app = express();
 
-// Add CORS middleware before routes
+// Add CORS middleware before routes s
 app.use(cors({
   origin: "*",
   methods: ["GET", "POST", "DELETE"]
@@ -522,3 +522,4 @@ httpServer.listen(PORT, () => {
   console.log(`   - GET /api/messages/:driverId - Get messages for driver`);
   console.log(`   - DELETE /api/messages/:messageId - Delete specific message`);
 });
+
