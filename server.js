@@ -1,4 +1,4 @@
- const express = require('express');
+const express = require('express');
 const { createServer } = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
@@ -21,7 +21,9 @@ const io = new Server(httpServer, {
   cors: {
     origin: "*",
     methods: ["GET", "POST"]
-  }
+  },
+  pingTimeout: 60000,
+  pingInterval: 25000
 });
 
 // MySQL Configuration
@@ -41,6 +43,7 @@ const pool = mysql.createPool(dbConfig);
 // Track online status and users
 let adminOnline = false;
 const users = {}; // { socketId: { type: 'user'|'admin', name: string, driverId?: string } }
+const adminChats = new Set(); // Track which chats admin is currently in
 
 // Create messages table if not exists
 async function initializeDatabase() {
@@ -87,9 +90,45 @@ async function initializeDatabase() {
 
 initializeDatabase();
 
+// Function to update admin online status
+function updateAdminStatus() {
+  const adminCount = Object.values(users).filter(user => user.type === 'admin').length;
+  const newAdminOnline = adminCount > 0;
+  
+  if (newAdminOnline !== adminOnline) {
+    adminOnline = newAdminOnline;
+    io.emit('adminStatus', adminOnline);
+    console.log(`🔄 Admin status changed to: ${adminOnline ? 'ONLINE' : 'OFFLINE'}`);
+  }
+  
+  return adminOnline;
+}
+
+// Function to get online users list
+function getOnlineUsersList() {
+  return Object.entries(users).map(([id, user]) => ({
+    id,
+    name: user.name,
+    type: user.type,
+    driverId: user.driverId,
+  }));
+}
+
+// Function to notify driver about admin status
+function notifyDriverAdminStatus(driverId, isOnline) {
+  const driverSocket = Object.entries(users).find(
+    ([id, user]) => user.driverId === driverId && user.type === 'user'
+  );
+  
+  if (driverSocket) {
+    io.to(driverSocket[0]).emit('adminStatus', isOnline);
+    console.log(`📢 Notified driver ${driverId} that admin is ${isOnline ? 'online' : 'offline'}`);
+  }
+}
+
 // Add message deletion event handler
 io.on('connection', (socket) => {
-  console.log(`User connected: ${socket.id}`);
+  console.log(`🔌 User connected: ${socket.id}`);
 
   socket.on('register', (userType, userName, driverId) => {
     users[socket.id] = {
@@ -97,20 +136,56 @@ io.on('connection', (socket) => {
       name: userName || `User-${socket.id.slice(0, 4)}`,
       driverId,
     };
+    
     socket.join(userType);
+    
     if (userType === 'admin') {
-      adminOnline = true;
-      io.emit('adminStatus', true);
-      console.log('Admin registered and online');
+      console.log('👨‍💼 Admin registered:', userName);
+      // Update admin status and notify all users
+      updateAdminStatus();
+    } else if (userType === 'user') {
+      console.log('👤 Driver registered:', userName, 'ID:', driverId);
+      // Notify this specific driver about current admin status
+      socket.emit('adminStatus', adminOnline);
+      console.log(`📢 Sent initial admin status to driver ${driverId}: ${adminOnline ? 'online' : 'offline'}`);
     }
-    const onlineUsers = Object.entries(users).map(([id, user]) => ({
-      id,
-      name: user.name,
-      type: user.type,
-      driverId: user.driverId,
-    }));
+    
+    // Update online users list
+    const onlineUsers = getOnlineUsersList();
     io.emit('onlineUsers', onlineUsers);
-    console.log(`User registered: ${userName} (${userType})`);
+    console.log(`✅ User registered: ${userName} (${userType})`);
+  });
+
+  // Admin joining a specific driver chat
+  socket.on('adminJoinChat', (driverId) => {
+    console.log(`👨‍💼 Admin ${socket.id} joined chat with driver: ${driverId}`);
+    
+    // Add to admin chats tracking
+    adminChats.add(driverId);
+    
+    // Notify the specific driver that admin joined their chat
+    notifyDriverAdminStatus(driverId, true);
+    
+    // Join the specific chat room
+    socket.join(`admin_chat_${driverId}`);
+    
+    console.log(`💬 Admin now in chat with driver: ${driverId}`);
+  });
+
+  // Admin leaving a specific driver chat
+  socket.on('adminLeaveChat', (driverId) => {
+    console.log(`👨‍💼 Admin ${socket.id} left chat with driver: ${driverId}`);
+    
+    // Remove from admin chats tracking
+    adminChats.delete(driverId);
+    
+    // Notify the specific driver that admin left their chat
+    notifyDriverAdminStatus(driverId, false);
+    
+    // Leave the specific chat room
+    socket.leave(`admin_chat_${driverId}`);
+    
+    console.log(`🚪 Admin left chat with driver: ${driverId}`);
   });
 
   // New event to get driver's socket ID
@@ -137,20 +212,16 @@ io.on('connection', (socket) => {
         driverSocket.disconnect(true);
       }
     });
-    const onlineUsers = Object.entries(users).map(([id, user]) => ({
-      id,
-      name: user.name,
-      type: user.type,
-      driverId: user.driverId,
-    }));
+    
+    const onlineUsers = getOnlineUsersList();
     io.emit('onlineUsers', onlineUsers);
-    console.log(`User manually disconnected: ${driverId}`);
+    console.log(`👤 User manually disconnected: ${driverId}`);
   });
 
   // Handle message deletion
   socket.on('deleteMessage', async (messageId, driverId) => {
     try {
-      console.log(`Deleting message: ${messageId} for driver: ${driverId}`);
+      console.log(`🗑️ Deleting message: ${messageId} for driver: ${driverId}`);
       
       const connection = await pool.getConnection();
       try {
@@ -166,17 +237,17 @@ io.on('connection', (socket) => {
           [messageId]
         );
         
-        console.log(`Message deleted from database: ${messageId}`);
+        console.log(`✅ Message deleted from database: ${messageId}`);
         
         // Emit event to all clients to remove the message
         io.emit('messageDeleted', messageId);
-        console.log(`Message deleted event emitted: ${messageId}`);
+        console.log(`📢 Message deleted event emitted: ${messageId}`);
         
       } finally {
         connection.release();
       }
     } catch (error) {
-      console.error('Error deleting message:', error);
+      console.error('❌ Error deleting message:', error);
     }
   });
 
@@ -243,7 +314,7 @@ io.on('connection', (socket) => {
         }
       }
     } catch (error) {
-      console.error('Error saving message or media:', error);
+      console.error('❌ Error saving message or media:', error);
     } finally {
       if (connection) connection.release();
     }
@@ -279,29 +350,80 @@ io.on('connection', (socket) => {
     console.log(`📥 Message RECEIVED by ${receiverName}:`, message.text || '[Media message]');
   });
 
-  socket.on('disconnect', (reason) => {
-    console.log(`User disconnected: ${socket.id}, reason: ${reason}`);
-    const disconnectedUser = users[socket.id];
-    if (disconnectedUser?.type === 'admin') {
-      adminOnline = false;
-      io.emit('adminStatus', false);
-      console.log('Admin went offline');
-    }
-    delete users[socket.id];
-    const onlineUsers = Object.entries(users).map(([id, user]) => ({
-      id,
-      name: user.name,
-      type: user.type,
-      driverId: user.driverId,
-    }));
+  // Handle user connection status
+  socket.on('userConnected', (userData) => {
+    console.log(`👤 User connected event:`, userData);
+    const onlineUsers = getOnlineUsersList();
     io.emit('onlineUsers', onlineUsers);
   });
+
+  // Handle user disconnection status
+  socket.on('userDisconnected', (userData) => {
+    console.log(`👤 User disconnected event:`, userData);
+    const onlineUsers = getOnlineUsersList();
+    io.emit('onlineUsers', onlineUsers);
+  });
+
+  // Get online users
+  socket.on('getOnlineUsers', () => {
+    const onlineUsers = getOnlineUsersList();
+    socket.emit('onlineUsers', onlineUsers);
+  });
+
+  socket.on('disconnect', (reason) => {
+    console.log(`🔌 User disconnected: ${socket.id}, reason: ${reason}`);
+    const disconnectedUser = users[socket.id];
+    
+    if (disconnectedUser) {
+      if (disconnectedUser.type === 'admin') {
+        console.log('👨‍💼 Admin disconnected');
+        
+        // Remove admin from all chat rooms they were in
+        for (const driverId of adminChats) {
+          if (adminChats.has(driverId)) {
+            notifyDriverAdminStatus(driverId, false);
+            console.log(`📢 Notified driver ${driverId} that admin left chat`);
+          }
+        }
+        
+        // Clear admin chats
+        adminChats.clear();
+      } else if (disconnectedUser.type === 'user') {
+        console.log(`👤 Driver disconnected: ${disconnectedUser.driverId}`);
+      }
+      
+      delete users[socket.id];
+    }
+    
+    // Update admin status after user removal
+    updateAdminStatus();
+    
+    // Update online users list
+    const onlineUsers = getOnlineUsersList();
+    io.emit('onlineUsers', onlineUsers);
+  });
+
+  // Handle connection errors
+  socket.on('connect_error', (error) => {
+    console.error('❌ Socket connection error:', error);
+  });
 });
+
+// Periodic admin status check and broadcast
+setInterval(() => {
+  const currentAdminOnline = updateAdminStatus();
+  const onlineUsers = getOnlineUsersList();
+  
+  console.log(`🔄 Periodic status check - Admin: ${currentAdminOnline ? 'ONLINE' : 'OFFLINE'}, Users: ${onlineUsers.length}`);
+  
+  // Broadcast online users list periodically
+  io.emit('onlineUsers', onlineUsers);
+}, 10000); // Check every 10 seconds
 
 // API endpoint to fetch old messages with associated media
 app.get('/api/messages/:driverId', async (req, res) => {
   try {
-    console.log(`Fetching messages for driver: ${req.params.driverId}`);
+    console.log(`📋 Fetching messages for driver: ${req.params.driverId}`);
     
     const connection = await pool.getConnection();
     try {
@@ -325,7 +447,7 @@ app.get('/api/messages/:driverId', async (req, res) => {
         [req.params.driverId]
       );
 
-      console.log(`Found ${messageRows.length} message records`);
+      console.log(`📦 Found ${messageRows.length} message records`);
 
       // Group messages and their media
       const messagesMap = new Map();
@@ -361,14 +483,14 @@ app.get('/api/messages/:driverId', async (req, res) => {
       });
 
       const messages = Array.from(messagesMap.values());
-      console.log(`Returning ${messages.length} grouped messages`);
+      console.log(`✅ Returning ${messages.length} grouped messages`);
       
       res.json(messages);
     } finally {
       connection.release();
     }
   } catch (error) {
-    console.error('Error fetching messages:', error);
+    console.error('❌ Error fetching messages:', error);
     res.status(500).json({ 
       success: false,
       error: 'Failed to fetch messages',
@@ -381,7 +503,7 @@ app.get('/api/messages/:driverId', async (req, res) => {
 app.delete('/api/messages/:messageId', async (req, res) => {
   try {
     const { messageId } = req.params;
-    console.log(`API: Deleting message: ${messageId}`);
+    console.log(`🗑️ API: Deleting message: ${messageId}`);
     
     const connection = await pool.getConnection();
     try {
@@ -397,7 +519,7 @@ app.delete('/api/messages/:messageId', async (req, res) => {
         [messageId]
       );
       
-      console.log(`API: Message deleted successfully: ${messageId}`);
+      console.log(`✅ API: Message deleted successfully: ${messageId}`);
       res.json({ 
         success: true, 
         message: 'Message deleted successfully',
@@ -407,7 +529,7 @@ app.delete('/api/messages/:messageId', async (req, res) => {
       connection.release();
     }
   } catch (error) {
-    console.error('API: Error deleting message:', error);
+    console.error('❌ API: Error deleting message:', error);
     res.status(500).json({ 
       success: false,
       error: 'Failed to delete message',
@@ -418,11 +540,14 @@ app.delete('/api/messages/:messageId', async (req, res) => {
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
+  const onlineUsers = getOnlineUsersList();
   res.json({ 
     status: 'OK', 
     timestamp: new Date().toISOString(),
     adminOnline: adminOnline,
-    connectedUsers: Object.keys(users).length
+    connectedUsers: onlineUsers.length,
+    onlineUsers: onlineUsers,
+    adminChats: Array.from(adminChats)
   });
 });
 
@@ -438,13 +563,38 @@ app.get('/api/test-db', async (req, res) => {
       result: result 
     });
   } catch (error) {
-    console.error('Database test failed:', error);
+    console.error('❌ Database test failed:', error);
     res.status(500).json({ 
       success: false, 
       error: 'Database connection failed',
       details: error.message 
     });
   }
+});
+
+// Get current admin status
+app.get('/api/admin-status', (req, res) => {
+  res.json({ 
+    adminOnline: adminOnline,
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Get driver's admin chat status
+app.get('/api/driver-status/:driverId', (req, res) => {
+  const driverId = req.params.driverId;
+  const isAdminInChat = adminChats.has(driverId);
+  const driverSocket = Object.entries(users).find(
+    ([id, user]) => user.driverId === driverId && user.type === 'user'
+  );
+  
+  res.json({ 
+    driverId: driverId,
+    driverOnline: !!driverSocket,
+    adminOnline: adminOnline,
+    adminInChat: isAdminInChat,
+    timestamp: new Date().toISOString()
+  });
 });
 
 function getLocalIpAddress() {
@@ -470,6 +620,8 @@ httpServer.listen(PORT, () => {
   console.log(`   API endpoints:`);
   console.log(`   - GET /api/health - Health check`);
   console.log(`   - GET /api/test-db - Test database connection`);
+  console.log(`   - GET /api/admin-status - Get admin status`);
+  console.log(`   - GET /api/driver-status/:driverId - Get driver chat status`);
   console.log(`   - GET /api/messages/:driverId - Get messages for driver`);
   console.log(`   - DELETE /api/messages/:messageId - Delete specific message`);
 });
