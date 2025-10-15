@@ -347,48 +347,7 @@ io.on('connection', (socket) => {
   });
 });
 
-// Add this to your WebSocket server (webshocket-18t1.onrender.com)
-app.get('/api/messages/:driverId/unread', async (req, res) => {
-  try {
-    const { driverId } = req.params;
-    
-    // Query your database to count unread messages for this driver
-    // This is a simplified example - adjust based on your database structure
-    const unreadCount = await Message.countDocuments({
-      driverId,
-      sender_type: 'user',
-      read: false
-    });
-    
-    res.json({ unreadCount });
-  } catch (error) {
-    console.error('Error fetching unread count:', error);
-    res.status(500).json({ error: 'Failed to fetch unread count' });
-  }
-});
 
-app.post('/api/messages/:driverId/read', async (req, res) => {
-  try {
-    const { driverId } = req.params;
-    
-    // Update all messages from this driver as read
-    await Message.updateMany(
-      { 
-        driverId, 
-        sender_type: 'user',
-        read: false 
-      },
-      { 
-        $set: { read: true, readAt: new Date() } 
-      }
-    );
-    
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Error marking messages as read:', error);
-    res.status(500).json({ error: 'Failed to mark messages as read' });
-  }
-});
 
 
 // API endpoint to get all connected drivers
@@ -680,7 +639,6 @@ httpServer.listen(PORT, () => {
   console.log(`   - GET /api/messages/:driverId - Get messages for driver`);
   console.log(`   - DELETE /api/messages/:messageId - Delete specific message`);
 });
-
 
 
 
