@@ -7,7 +7,7 @@ const mysql = require('mysql2/promise');
 
 const app = express();
 
-// Add CORS middleware before routes
+// Add CORS middleware before routes s
 app.use(cors({
   origin: "*",
   methods: ["GET", "POST", "DELETE"]
@@ -69,11 +69,10 @@ async function initializeDatabase() {
         driver_id VARCHAR(50) NOT NULL,
         file_name VARCHAR(255) NOT NULL,
         file_url VARCHAR(255) NOT NULL,
-        media_type ENUM('image', 'video', 'file', 'audio') NOT NULL,
+        media_type ENUM('image', 'video', 'gif', 'file') NOT NULL,
         upload_time DATETIME NOT NULL,
         file_size INT,
         mime_type VARCHAR(100),
-        duration INT,
         INDEX (message_id),
         INDEX (driver_id)
       )
@@ -105,15 +104,15 @@ function getOnlineUsersList() {
     isOnline: isAdminOnline()
   });
   
-  // Add driver users
+  // Add driver users who are currently in chat
   Object.entries(users).forEach(([socketId, user]) => {
-    if (user.type === 'user') {
+    if (user.type === 'user' && user.isInChat) {
       onlineUsers.push({
         id: socketId,
         name: user.name,
         type: user.type,
         driverId: user.driverId,
-        isOnline: true // Driver is online if in users object
+        isOnline: user.isInChat
       });
     }
   });
@@ -125,16 +124,10 @@ function getOnlineUsersList() {
 function emitOnlineUsers() {
   const onlineUsers = getOnlineUsersList();
   io.emit('onlineUsers', onlineUsers);
-  console.log('Online users updated:', onlineUsers.length);
+  console.log('Online users updated:', onlineUsers);
 }
 
-// Helper function to find driver socket by driverId
-function findDriverSocket(driverId) {
-  return Object.entries(users).find(
-    ([socketId, user]) => user.driverId === driverId && user.type === 'user'
-  );
-}
-
+// Add message deletion event handler
 io.on('connection', (socket) => {
   console.log(`User connected: ${socket.id}`);
 
@@ -142,49 +135,65 @@ io.on('connection', (socket) => {
     users[socket.id] = {
       type: userType,
       name: userName || `User-${socket.id.slice(0, 4)}`,
-      driverId: driverId,
-      isInChat: true // Both admin and driver are considered in chat when registered
+      driverId,
+      isInChat: userType === 'admin' ? true : false // Admin is always in chat, drivers start as not in chat
     };
+    
+    socket.join(userType);
     
     if (userType === 'admin') {
       adminUsers[socket.id] = true;
-      console.log(`Admin registered: ${socket.id}`);
-    } else {
-      console.log(`Driver registered: ${userName} (${driverId})`);
+      console.log('Admin registered and online');
     }
     
     emitOnlineUsers();
-    
-    // Emit admin status to all drivers when admin connects/disconnects
-    if (userType === 'admin') {
-      io.emit('adminStatus', true);
-    }
+    console.log(`User registered: ${userName} (${userType})`);
   });
 
-  // Driver enters chat
+  // Driver enters chat - update their status
   socket.on('enterChat', (driverId) => {
     if (users[socket.id] && users[socket.id].type === 'user') {
       users[socket.id].isInChat = true;
       console.log(`Driver ${driverId} entered chat`);
-      
-      // Notify all admins that driver entered chat
-      Object.keys(adminUsers).forEach(adminSocketId => {
-        io.to(adminSocketId).emit('adminJoinChat', driverId);
-      });
+      emitOnlineUsers();
     }
   });
 
-  // Driver leaves chat
+  // Driver leaves chat - update their status
   socket.on('leaveChat', (driverId) => {
     if (users[socket.id] && users[socket.id].type === 'user') {
       users[socket.id].isInChat = false;
       console.log(`Driver ${driverId} left chat`);
-      
-      // Notify all admins that driver left chat
-      Object.keys(adminUsers).forEach(adminSocketId => {
-        io.to(adminSocketId).emit('adminLeaveChat', driverId);
-      });
+      emitOnlineUsers();
     }
+  });
+
+  // New event to get driver's socket ID
+  socket.on('getDriverSocketId', (driverId, callback) => {
+    const driverSocket = Object.entries(users).find(
+      ([id, user]) => user.driverId === driverId && user.type === 'user' && user.isInChat
+    );
+    if (driverSocket) {
+      callback(driverSocket[0]); // Return the socket ID
+    } else {
+      callback(null); // Driver not found or not in chat
+    }
+  });
+
+  // Handle manual driver disconnection
+  socket.on('disconnectUser', (driverId) => {
+    const driverSockets = Object.entries(users).filter(
+      ([id, user]) => user.driverId === driverId && user.type === 'user'
+    );
+    driverSockets.forEach(([socketId, user]) => {
+      delete users[socketId];
+      const driverSocket = io.sockets.sockets.get(socketId);
+      if (driverSocket) {
+        driverSocket.disconnect(true);
+      }
+    });
+    emitOnlineUsers();
+    console.log(`User manually disconnected: ${driverId}`);
   });
 
   // Handle message deletion
@@ -195,7 +204,7 @@ io.on('connection', (socket) => {
       const connection = await pool.getConnection();
       try {
         // Delete from messages table
-        await connection.query(
+        const [messageResult] = await connection.query(
           'DELETE FROM messages WHERE message_id = ? AND driver_id = ?',
           [messageId, driverId]
         );
@@ -221,11 +230,10 @@ io.on('connection', (socket) => {
   });
 
   socket.on('sendMessage', async (message) => {
-    const { id, receiverId, driverId, text, media, sender_type, senderId } = message;
-    
+    const { id, receiverId, driverId, text, media, sender_type } = message;
     const messageWithTimestamp = {
       message_id: id,
-      sender_id: senderId || socket.id, // Use provided senderId or socket.id
+      sender_id: socket.id,
       receiver_id: receiverId,
       driver_id: driverId,
       text: text || '',
@@ -236,7 +244,7 @@ io.on('connection', (socket) => {
     // Log sent message
     const senderInfo = users[socket.id];
     const senderName = senderInfo ? senderInfo.name : 'Unknown';
-    console.log(`📤 Message SENT from ${senderName} (${sender_type}) to driver ${driverId}:`, text || '[Media message]');
+    console.log(`📤 Message SENT from ${senderName} (${sender_type}):`, text || '[Media message]');
 
     let connection;
     try {
@@ -256,23 +264,31 @@ io.on('connection', (socket) => {
         ]
       );
 
-      // If media is present, insert it
+      // If media is present, check if it already exists before inserting
       if (media && media.length > 0) {
         for (const item of media) {
-          await connection.query(
-            'INSERT INTO media_uploads (message_id, driver_id, file_name, file_url, media_type, upload_time, file_size, mime_type, duration) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            [
-              messageWithTimestamp.message_id,
-              messageWithTimestamp.driver_id,
-              item.file_name,
-              item.file_url,
-              item.media_type,
-              messageWithTimestamp.timestamp,
-              item.file_size,
-              item.mime_type,
-              item.duration || null
-            ]
+          // Check if this media item already exists for this message
+          const [existingMedia] = await connection.query(
+            'SELECT id FROM media_uploads WHERE message_id = ? AND file_url = ?',
+            [messageWithTimestamp.message_id, item.file_url]
           );
+
+          // Only insert if it doesn't exist
+          if (existingMedia.length === 0) {
+            await connection.query(
+              'INSERT INTO media_uploads (message_id, driver_id, file_name, file_url, media_type, upload_time, file_size, mime_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+              [
+                messageWithTimestamp.message_id,
+                messageWithTimestamp.driver_id,
+                item.file_name,
+                item.file_url,
+                item.media_type,
+                messageWithTimestamp.timestamp,
+                item.file_size,
+                item.mime_type,
+              ]
+            );
+          }
         }
       }
     } catch (error) {
@@ -281,42 +297,38 @@ io.on('connection', (socket) => {
       if (connection) connection.release();
     }
 
-    // **FIXED: Improved message routing logic**
-    const finalMessage = {
-      ...message,
-      timestamp: messageWithTimestamp.timestamp
-    };
-
-    console.log(`Routing message: sender_type=${sender_type}, driverId=${driverId}`);
-
-    if (sender_type === 'support') {
-      // Message from admin to driver
-      const driverSocket = findDriverSocket(driverId);
-      if (driverSocket) {
-        const [driverSocketId, driverUser] = driverSocket;
-        io.to(driverSocketId).emit('receiveMessage', finalMessage);
-        console.log(`📨 Message DELIVERED to Driver: ${driverUser.name} (${driverId})`);
-      } else {
-        console.log(`❌ Driver ${driverId} not found online, message stored but not delivered`);
+    // Message routing logic
+    if (receiverId) {
+      if (users[receiverId]) {
+        io.to(receiverId).emit('receiveMessage', message);
+        const receiverInfo = users[receiverId];
+        console.log(`📨 Message DELIVERED to ${receiverInfo.name} (${receiverInfo.type})`);
+      } else if (receiverId === 'admin') {
+        // Send to all admin sockets
+        Object.keys(adminUsers).forEach(adminSocketId => {
+          io.to(adminSocketId).emit('receiveMessage', message);
+        });
+        console.log(`📨 Message DELIVERED to Admin`);
+      } else if (messageWithTimestamp.driver_id) {
+        const driverSocket = Object.entries(users).find(
+          ([id, user]) => user.driverId === messageWithTimestamp.driver_id && user.type === 'user'
+        );
+        if (driverSocket) {
+          io.to(driverSocket[0]).emit('receiveMessage', message);
+          console.log(`📨 Message DELIVERED to Driver ${messageWithTimestamp.driver_id}`);
+        }
       }
-      
-      // Also send to all admins for their chat windows
-      Object.keys(adminUsers).forEach(adminSocketId => {
-        io.to(adminSocketId).emit('receiveMessage', finalMessage);
-      });
-      console.log(`📨 Message SENT to all admins`);
-      
-    } else if (sender_type === 'user') {
-      // Message from driver
-      // Send to all admins
-      Object.keys(adminUsers).forEach(adminSocketId => {
-        io.to(adminSocketId).emit('receiveMessage', finalMessage);
-      });
-      console.log(`📨 Message from Driver DELIVERED to all admins`);
-      
-      // Also send back to the driver for their own chat
-      io.to(socket.id).emit('receiveMessage', finalMessage);
+    } else {
+      io.emit('receiveMessage', message);
+      console.log(`📨 Message BROADCASTED to all users`);
     }
+  });
+
+  // Listen for received messages
+  socket.on('receiveMessage', (message) => {
+    const receiverInfo = users[socket.id];
+    const receiverName = receiverInfo ? receiverInfo.name : 'Unknown';
+    console.log(`📥 Message RECEIVED by ${receiverName}:`, message.text || '[Media message]');
   });
 
   socket.on('disconnect', (reason) => {
@@ -327,36 +339,34 @@ io.on('connection', (socket) => {
       if (disconnectedUser.type === 'admin') {
         delete adminUsers[socket.id];
         console.log('Admin disconnected');
-        // Notify all drivers that admin is offline
-        io.emit('adminStatus', false);
-      } else {
-        // Driver disconnected - notify admins
-        Object.keys(adminUsers).forEach(adminSocketId => {
-          io.to(adminSocketId).emit('userDisconnected', disconnectedUser.driverId);
-        });
       }
       delete users[socket.id];
     }
     
     emitOnlineUsers();
   });
-
-  // Admin status request
-  socket.on('getAdminStatus', () => {
-    socket.emit('adminStatus', isAdminOnline());
-  });
 });
+
+
+
 
 // API endpoint to get all connected drivers
 app.get('/api/connected-drivers', (req, res) => {
   try {
-    const connectedDrivers = Object.values(users)
-      .filter(user => user.type === 'user')
-      .map(user => ({
-        driverId: user.driverId,
-        name: user.name,
-        isOnline: true
-      }));
+    const connectedDrivers = [];
+    
+    // Iterate through all users and filter for connected drivers
+    Object.entries(users).forEach(([socketId, user]) => {
+      if (user.type === 'user' && user.isInChat) {
+        connectedDrivers.push({
+          socketId: socketId,
+          driverId: user.driverId,
+          name: user.name,
+          isInChat: user.isInChat,
+          connectionTime: new Date().toISOString() // You might want to track this separately
+        });
+      }
+    });
 
     console.log(`Found ${connectedDrivers.length} connected drivers`);
     
@@ -369,12 +379,92 @@ app.get('/api/connected-drivers', (req, res) => {
     console.error('Error fetching connected drivers:', error);
     res.status(500).json({
       success: false,
-      error: 'Failed to fetch connected drivers'
+      error: 'Failed to fetch connected drivers',
+      details: error.message
     });
   }
 });
 
-// API endpoint to get messages for a driver
+// API endpoint to get all drivers (including those not in chat)
+app.get('/api/all-drivers', (req, res) => {
+  try {
+    const allDrivers = [];
+    
+    Object.entries(users).forEach(([socketId, user]) => {
+      if (user.type === 'user') {
+        allDrivers.push({
+          socketId: socketId,
+          driverId: user.driverId,
+          name: user.name,
+          isInChat: user.isInChat,
+          isOnline: true, // Since they're in the users object, they're connected
+          connectionTime: new Date().toISOString()
+        });
+      }
+    });
+
+    console.log(`Found ${allDrivers.length} total driver connections`);
+    
+    res.json({
+      success: true,
+      count: allDrivers.length,
+      drivers: allDrivers
+    });
+  } catch (error) {
+    console.error('Error fetching all drivers:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch drivers',
+      details: error.message
+    });
+  }
+});
+
+// API endpoint to get driver connection status
+app.get('/api/driver-status/:driverId', (req, res) => {
+  try {
+    const { driverId } = req.params;
+    
+    const driverConnections = Object.entries(users).filter(
+      ([socketId, user]) => user.driverId === driverId && user.type === 'user'
+    );
+
+    const status = {
+      driverId: driverId,
+      isOnline: driverConnections.length > 0,
+      connections: driverConnections.map(([socketId, user]) => ({
+        socketId: socketId,
+        name: user.name,
+        isInChat: user.isInChat,
+        connectionTime: new Date().toISOString()
+      })),
+      totalConnections: driverConnections.length
+    };
+
+    console.log(`Status for driver ${driverId}:`, status);
+    
+    res.json({
+      success: true,
+      status: status
+    });
+  } catch (error) {
+    console.error('Error fetching driver status:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch driver status',
+      details: error.message
+    });
+  }
+});
+
+
+
+
+
+
+
+
+// API endpoint to fetch old messages with associated media
 app.get('/api/messages/:driverId', async (req, res) => {
   try {
     console.log(`Fetching messages for driver: ${req.params.driverId}`);
@@ -384,7 +474,7 @@ app.get('/api/messages/:driverId', async (req, res) => {
       const [messageRows] = await connection.query(
         `SELECT m.*,
          CASE
-           WHEN m.sender_type = 'support' THEN 'support'
+           WHEN m.sender_id = 'admin' THEN 'support'
            ELSE 'user'
          END as sender,
          m.sender_type,
@@ -393,8 +483,7 @@ app.get('/api/messages/:driverId', async (req, res) => {
          mu.file_url,
          mu.media_type,
          mu.file_size,
-         mu.mime_type,
-         mu.duration
+         mu.mime_type
          FROM messages m
          LEFT JOIN media_uploads mu ON m.message_id = mu.message_id
          WHERE m.driver_id = ?
@@ -432,8 +521,7 @@ app.get('/api/messages/:driverId', async (req, res) => {
             file_url: row.file_url,
             media_type: row.media_type,
             file_size: row.file_size,
-            mime_type: row.mime_type,
-            duration: row.duration
+            mime_type: row.mime_type
           });
         }
       });
@@ -449,7 +537,8 @@ app.get('/api/messages/:driverId', async (req, res) => {
     console.error('Error fetching messages:', error);
     res.status(500).json({ 
       success: false,
-      error: 'Failed to fetch messages'
+      error: 'Failed to fetch messages',
+      details: error.message 
     });
   }
 });
@@ -462,13 +551,23 @@ app.delete('/api/messages/:messageId', async (req, res) => {
     
     const connection = await pool.getConnection();
     try {
-      await connection.query('DELETE FROM messages WHERE message_id = ?', [messageId]);
-      await connection.query('DELETE FROM media_uploads WHERE message_id = ?', [messageId]);
+      // Delete from messages table
+      const [messageResult] = await connection.query(
+        'DELETE FROM messages WHERE message_id = ?',
+        [messageId]
+      );
+      
+      // Delete associated media
+      await connection.query(
+        'DELETE FROM media_uploads WHERE message_id = ?',
+        [messageId]
+      );
       
       console.log(`API: Message deleted successfully: ${messageId}`);
       res.json({ 
         success: true, 
-        message: 'Message deleted successfully'
+        message: 'Message deleted successfully',
+        deletedId: messageId 
       });
     } finally {
       connection.release();
@@ -477,7 +576,8 @@ app.delete('/api/messages/:messageId', async (req, res) => {
     console.error('API: Error deleting message:', error);
     res.status(500).json({ 
       success: false,
-      error: 'Failed to delete message'
+      error: 'Failed to delete message',
+      details: error.message 
     });
   }
 });
@@ -492,9 +592,54 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+// Test database connection endpoint
+app.get('/api/test-db', async (req, res) => {
+  try {
+    const connection = await pool.getConnection();
+    const [result] = await connection.query('SELECT 1 as test');
+    connection.release();
+    res.json({ 
+      success: true, 
+      message: 'Database connection successful',
+      result: result 
+    });
+  } catch (error) {
+    console.error('Database test failed:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Database connection failed',
+      details: error.message 
+    });
+  }
+});
+
+function getLocalIpAddress() {
+  const interfaces = os.networkInterfaces();
+  for (const devName in interfaces) {
+    const iface = interfaces[devName];
+    for (let i = 0; i < iface.length; i++) {
+      const alias = iface[i];
+      if (alias.family === 'IPv4' && alias.address !== '127.0.0.1' && !alias.internal) {
+        return alias.address;
+      }
+    }
+  }
+  return '0.0.0.0';
+}
+
 const PORT = process.env.PORT || 3000;
 httpServer.listen(PORT, () => {
-  const localIp = require('os').networkInterfaces();
-  console.log(`🚀 Socket.IO server running on port ${PORT}`);
-  console.log(`   API endpoints available at http://localhost:${PORT}/api`);
+  const localIp = getLocalIpAddress();
+  console.log(`🚀 Socket.IO server running at:`);
+  console.log(`   Local:   http://localhost:${PORT}`);
+  console.log(`   Network: http://${localIp}:${PORT}`);
+  console.log(`   API endpoints:`);
+  console.log(`   - GET /api/health - Health check`);
+  console.log(`   - GET /api/test-db - Test database connection`);
+  console.log(`   - GET /api/messages/:driverId - Get messages for driver`);
+  console.log(`   - DELETE /api/messages/:messageId - Delete specific message`);
 });
+
+
+
+
