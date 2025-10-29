@@ -27,9 +27,9 @@ const io = new Server(httpServer, {
 // MySQL Configuration
 const dbConfig = {
   host: "srv657.hstgr.io",
-  user: "u442108067_mydb",
-  password: "mOhe6ln0iP>",
-  database: "u442108067_mydb",
+  user: "u442108067_MoveExpress",
+  password: "@1ItH~?ztgV",
+  database: "u442108067_MoveExpress",
   waitForConnections: true,
   connectionLimit: 50,
   queueLimit: 10
@@ -639,6 +639,7 @@ httpServer.listen(PORT, () => {
   console.log(`   - GET /api/messages/:driverId - Get messages for driver`);
   console.log(`   - DELETE /api/messages/:messageId - Delete specific message`);
 });
+
 
 
 
