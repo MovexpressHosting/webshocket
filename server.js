@@ -7,7 +7,7 @@ const mysql = require('mysql2/promise');
 
 const app = express();
 
-// Add CORS middleware before routes s
+// Add CORS middleware before routes
 app.use(cors({
   origin: "*",
   methods: ["GET", "POST", "DELETE"]
@@ -69,7 +69,7 @@ async function initializeDatabase() {
         driver_id VARCHAR(50) NOT NULL,
         file_name VARCHAR(255) NOT NULL,
         file_url VARCHAR(255) NOT NULL,
-        media_type ENUM('image', 'video', 'gif', 'file') NOT NULL,
+        media_type ENUM('image', 'video', 'gif', 'file', 'audio') NOT NULL,
         upload_time DATETIME NOT NULL,
         file_size INT,
         mime_type VARCHAR(100),
@@ -244,7 +244,10 @@ io.on('connection', (socket) => {
     // Log sent message
     const senderInfo = users[socket.id];
     const senderName = senderInfo ? senderInfo.name : 'Unknown';
-    console.log(`📤 Message SENT from ${senderName} (${sender_type}):`, text || '[Media message]');
+    console.log(`📤 MESSAGE SENT from ${senderName} (${sender_type})`);
+    console.log(`   Receiver ID: ${receiverId}`);
+    console.log(`   Driver ID: ${driverId}`);
+    console.log(`   Text: ${text || '[Media message]'}`);
 
     let connection;
     try {
@@ -297,68 +300,75 @@ io.on('connection', (socket) => {
       if (connection) connection.release();
     }
 
-    // Message routing logic
-    // Message routing logic - CORRECTED VERSION
-if (receiverId) {
-  console.log(`Looking to deliver message to receiverId: ${receiverId}`);
-  
-  // Check if receiverId is a socket ID of a connected user
-  if (users[receiverId]) {
-    // Direct socket-to-socket delivery
-    io.to(receiverId).emit('receiveMessage', message);
-    const receiverInfo = users[receiverId];
-    console.log(`📨 Message DELIVERED to ${receiverInfo.name} (${receiverInfo.type}) via socket ID`);
-  } 
-  // If receiver is "admin" and sender is a driver
-  else if (receiverId === 'admin' && sender_type === 'user') {
-    // Send to all admin sockets
-    Object.keys(adminUsers).forEach(adminSocketId => {
-      io.to(adminSocketId).emit('receiveMessage', message);
-    });
-    console.log(`📨 Message from driver DELIVERED to all Admin sockets`);
-  }
-  // If receiver is a driver ID and sender is admin
-  else if (sender_type === 'support' || sender_type === 'admin') {
-    console.log(`Looking for driver with ID: ${receiverId}`);
+    // ========== CRITICAL FIX: CORRECTED MESSAGE ROUTING LOGIC ==========
     
-    // Find ALL sockets for this driver ID (user might have multiple connections)
-    const driverSockets = Object.entries(users).filter(
-      ([socketId, user]) => user.driverId === receiverId && user.type === 'user'
-    );
+    console.log(`🔀 ROUTING MESSAGE: sender_type=${sender_type}, receiverId=${receiverId}, driverId=${driverId}`);
     
-    console.log(`Found ${driverSockets.length} sockets for driver ${receiverId}`);
-    
-    if (driverSockets.length > 0) {
-      driverSockets.forEach(([socketId, user]) => {
-        io.to(socketId).emit('receiveMessage', message);
-        console.log(`📨 Message from admin DELIVERED to driver ${receiverId} via socket ${socketId}`);
+    // CASE 1: Driver sends message to admin
+    if (sender_type === 'user' && receiverId === 'admin') {
+      console.log(`📨 CASE 1: Driver → Admin`);
+      // Send to all admin sockets
+      Object.keys(adminUsers).forEach(adminSocketId => {
+        io.to(adminSocketId).emit('receiveMessage', message);
       });
-    } else {
-      console.log(`⚠️ Driver ${receiverId} is not connected. Message saved but not delivered in real-time.`);
+      console.log(`   Delivered to ${Object.keys(adminUsers).length} admin(s)`);
     }
-  }
-  // Fallback: use driver_id from the message
-  else if (messageWithTimestamp.driver_id) {
-    console.log(`Fallback: Using driver_id ${messageWithTimestamp.driver_id}`);
     
-    const driverSockets = Object.entries(users).filter(
-      ([socketId, user]) => user.driverId === messageWithTimestamp.driver_id && user.type === 'user'
-    );
+    // CASE 2: Admin sends message to driver
+    else if ((sender_type === 'support' || sender_type === 'admin') && receiverId && receiverId !== 'admin') {
+      console.log(`📨 CASE 2: Admin → Driver (receiverId: ${receiverId})`);
+      
+      // Find ALL sockets for this driver ID
+      const driverSockets = Object.entries(users).filter(
+        ([socketId, user]) => user.driverId === receiverId && user.type === 'user'
+      );
+      
+      console.log(`   Found ${driverSockets.length} socket(s) for driver ${receiverId}`);
+      
+      if (driverSockets.length > 0) {
+        driverSockets.forEach(([socketId, user]) => {
+          io.to(socketId).emit('receiveMessage', message);
+          console.log(`   Delivered to driver socket: ${socketId}`);
+        });
+      } else {
+        console.log(`   ⚠️ Driver ${receiverId} is not connected. Message saved to DB.`);
+      }
+    }
     
-    if (driverSockets.length > 0) {
-      driverSockets.forEach(([socketId, user]) => {
-        io.to(socketId).emit('receiveMessage', message);
+    // CASE 3: Admin sends message to "admin" (shouldn't happen but handle it)
+    else if (sender_type === 'support' && receiverId === 'admin') {
+      console.log(`📨 CASE 3: Admin → Admin (broadcast to all admins)`);
+      Object.keys(adminUsers).forEach(adminSocketId => {
+        io.to(adminSocketId).emit('receiveMessage', message);
       });
-      console.log(`📨 Message DELIVERED to Driver ${messageWithTimestamp.driver_id} (fallback)`);
-    } else {
-      console.log(`⚠️ Driver ${messageWithTimestamp.driver_id} not found. Message saved to DB only.`);
     }
-  }
-} else {
-  // Broadcast to everyone (should rarely happen)
-  io.emit('receiveMessage', message);
-  console.log(`📨 Message BROADCASTED to all users`);
-}
+    
+    // CASE 4: Fallback - use driver_id from message (for backward compatibility)
+    else if (driverId && driverId !== 'admin') {
+      console.log(`📨 CASE 4: Fallback using driverId: ${driverId}`);
+      
+      const driverSockets = Object.entries(users).filter(
+        ([socketId, user]) => user.driverId === driverId && user.type === 'user'
+      );
+      
+      if (driverSockets.length > 0) {
+        driverSockets.forEach(([socketId, user]) => {
+          io.to(socketId).emit('receiveMessage', message);
+          console.log(`   Delivered to driver socket: ${socketId}`);
+        });
+      } else {
+        console.log(`   ⚠️ Driver ${driverId} not found. Message saved to DB only.`);
+      }
+    }
+    
+    // CASE 5: Unknown scenario
+    else {
+      console.log(`📨 CASE 5: Unknown routing scenario`);
+      console.log(`   sender_type: ${sender_type}, receiverId: ${receiverId}, driverId: ${driverId}`);
+    }
+    
+    console.log(`✅ MESSAGE ROUTING COMPLETE\n`);
+  });
 
   // Listen for received messages
   socket.on('receiveMessage', (message) => {
@@ -382,9 +392,6 @@ if (receiverId) {
     emitOnlineUsers();
   });
 });
-
-
-
 
 // API endpoint to get all connected drivers
 app.get('/api/connected-drivers', (req, res) => {
@@ -492,13 +499,6 @@ app.get('/api/driver-status/:driverId', (req, res) => {
     });
   }
 });
-
-
-
-
-
-
-
 
 // API endpoint to fetch old messages with associated media
 app.get('/api/messages/:driverId', async (req, res) => {
@@ -675,8 +675,3 @@ httpServer.listen(PORT, () => {
   console.log(`   - GET /api/messages/:driverId - Get messages for driver`);
   console.log(`   - DELETE /api/messages/:messageId - Delete specific message`);
 });
-
-
-
-
-
