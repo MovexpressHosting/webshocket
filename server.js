@@ -298,31 +298,67 @@ io.on('connection', (socket) => {
     }
 
     // Message routing logic
-    if (receiverId) {
-      if (users[receiverId]) {
-        io.to(receiverId).emit('receiveMessage', message);
-        const receiverInfo = users[receiverId];
-        console.log(`📨 Message DELIVERED to ${receiverInfo.name} (${receiverInfo.type})`);
-      } else if (receiverId === 'admin') {
-        // Send to all admin sockets
-        Object.keys(adminUsers).forEach(adminSocketId => {
-          io.to(adminSocketId).emit('receiveMessage', message);
-        });
-        console.log(`📨 Message DELIVERED to Admin`);
-      } else if (messageWithTimestamp.driver_id) {
-        const driverSocket = Object.entries(users).find(
-          ([id, user]) => user.driverId === messageWithTimestamp.driver_id && user.type === 'user'
-        );
-        if (driverSocket) {
-          io.to(driverSocket[0]).emit('receiveMessage', message);
-          console.log(`📨 Message DELIVERED to Driver ${messageWithTimestamp.driver_id}`);
-        }
-      }
+    // Message routing logic - CORRECTED VERSION
+if (receiverId) {
+  console.log(`Looking to deliver message to receiverId: ${receiverId}`);
+  
+  // Check if receiverId is a socket ID of a connected user
+  if (users[receiverId]) {
+    // Direct socket-to-socket delivery
+    io.to(receiverId).emit('receiveMessage', message);
+    const receiverInfo = users[receiverId];
+    console.log(`📨 Message DELIVERED to ${receiverInfo.name} (${receiverInfo.type}) via socket ID`);
+  } 
+  // If receiver is "admin" and sender is a driver
+  else if (receiverId === 'admin' && sender_type === 'user') {
+    // Send to all admin sockets
+    Object.keys(adminUsers).forEach(adminSocketId => {
+      io.to(adminSocketId).emit('receiveMessage', message);
+    });
+    console.log(`📨 Message from driver DELIVERED to all Admin sockets`);
+  }
+  // If receiver is a driver ID and sender is admin
+  else if (sender_type === 'support' || sender_type === 'admin') {
+    console.log(`Looking for driver with ID: ${receiverId}`);
+    
+    // Find ALL sockets for this driver ID (user might have multiple connections)
+    const driverSockets = Object.entries(users).filter(
+      ([socketId, user]) => user.driverId === receiverId && user.type === 'user'
+    );
+    
+    console.log(`Found ${driverSockets.length} sockets for driver ${receiverId}`);
+    
+    if (driverSockets.length > 0) {
+      driverSockets.forEach(([socketId, user]) => {
+        io.to(socketId).emit('receiveMessage', message);
+        console.log(`📨 Message from admin DELIVERED to driver ${receiverId} via socket ${socketId}`);
+      });
     } else {
-      io.emit('receiveMessage', message);
-      console.log(`📨 Message BROADCASTED to all users`);
+      console.log(`⚠️ Driver ${receiverId} is not connected. Message saved but not delivered in real-time.`);
     }
-  });
+  }
+  // Fallback: use driver_id from the message
+  else if (messageWithTimestamp.driver_id) {
+    console.log(`Fallback: Using driver_id ${messageWithTimestamp.driver_id}`);
+    
+    const driverSockets = Object.entries(users).filter(
+      ([socketId, user]) => user.driverId === messageWithTimestamp.driver_id && user.type === 'user'
+    );
+    
+    if (driverSockets.length > 0) {
+      driverSockets.forEach(([socketId, user]) => {
+        io.to(socketId).emit('receiveMessage', message);
+      });
+      console.log(`📨 Message DELIVERED to Driver ${messageWithTimestamp.driver_id} (fallback)`);
+    } else {
+      console.log(`⚠️ Driver ${messageWithTimestamp.driver_id} not found. Message saved to DB only.`);
+    }
+  }
+} else {
+  // Broadcast to everyone (should rarely happen)
+  io.emit('receiveMessage', message);
+  console.log(`📨 Message BROADCASTED to all users`);
+}
 
   // Listen for received messages
   socket.on('receiveMessage', (message) => {
@@ -639,6 +675,7 @@ httpServer.listen(PORT, () => {
   console.log(`   - GET /api/messages/:driverId - Get messages for driver`);
   console.log(`   - DELETE /api/messages/:messageId - Delete specific message`);
 });
+
 
 
 
